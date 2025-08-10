@@ -1,4 +1,4 @@
-// /api/terraces.js — WFS → REST (met paging) → DEMO
+// /api/terraces.js — WFS → REST → DEMO + debug errors
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -6,8 +6,8 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   const headers = { 'Accept': 'application/json' };
+  const errors = {};
 
-  // Brede BBOX groot-Amsterdam (EPSG:4326)
   const WFS =
     'https://api.data.amsterdam.nl/v1/wfs/horeca/?' +
     'SERVICE=WFS&REQUEST=GetFeature&version=2.0.0' +
@@ -16,8 +16,8 @@ export default async function handler(req, res) {
     '&outputformat=geojson&srsName=urn:ogc:def:crs:EPSG::4326' +
     '&count=10000';
 
-  // REST start-URL (pagineert)
-  const REST_START = 'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
+  const REST_START =
+    'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
 
   const demo = { type: 'FeatureCollection', features: [
     { type:'Feature', id:'jaren',     properties:{ name:'Café de Jaren (demo)' }, geometry:{ type:'Polygon', coordinates:[[[4.89451,52.36620],[4.89475,52.36620],[4.89475,52.36608],[4.89451,52.36608],[4.89451,52.36620]]] } },
@@ -38,29 +38,32 @@ export default async function handler(req, res) {
 
   const fetchJSON = async url => {
     const r = await fetch(url, { headers });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
     return r.json();
   };
 
-  // Probeer 1) WFS
+  // 1) WFS
   try {
     let data = await fetchJSON(WFS);
     if (data?.features?.length) {
       data = norm(data, ['naam','bedrijfsnaam','zaak','naambedrijf','zaaknaam','adres']);
       return res.status(200).json({ source: 'wfs', count: data.features.length, ...data });
+    } else {
+      errors.error_wfs = 'WFS gaf 0 features terug';
     }
-  } catch {}
+  } catch (e) {
+    errors.error_wfs = String(e);
+  }
 
-  // Probeer 2) REST met paging
+  // 2) REST
   try {
     let url = REST_START;
     const all = { type: 'FeatureCollection', features: [] };
     let guard = 0;
-    while (url && guard++ < 20) { // max 20 pagina's
+    while (url && guard++ < 20) {
       const page = await fetchJSON(url);
       if (page?.features?.length) all.features.push(...page.features);
 
-      // vind "next" link
       url = null;
       if (page?.links) {
         const next = page.links.find(l => (l.rel || '').toLowerCase() === 'next');
@@ -73,9 +76,13 @@ export default async function handler(req, res) {
     if (all.features.length) {
       const data = norm(all, ['zaaknaam','naam','bedrijfsnaam','naambedrijf','adres']);
       return res.status(200).json({ source: 'rest', count: data.features.length, ...data });
+    } else {
+      errors.error_rest = 'REST gaf 0 features terug';
     }
-  } catch {}
+  } catch (e) {
+    errors.error_rest = String(e);
+  }
 
-  // 3) fallback demo
-  return res.status(200).json({ source: 'demo', count: demo.features.length, ...demo });
+  // 3) DEMO met foutinfo
+  return res.status(200).json({ source: 'demo', ...errors, count: demo.features.length, ...demo });
 }
