@@ -1,15 +1,16 @@
 <!doctype html>
 <html lang="nl">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SunTerras — AMS</title>
-  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SunTerras — Amsterdam</title>
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
   <style>
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
     header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    #map{position:absolute;inset:60px 0 0 0}
+    #map{position:absolute;inset:64px 0 0 0}
     .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
+    .hint{color:#6b7280;font-size:12px}
   </style>
 </head>
 <body>
@@ -19,6 +20,8 @@
   <span class="badge" id="dataBadge">Data: ?</span>
   <label>Tijd: <input id="time" type="time" step="300"></label>
   <label>Datum: <input id="date" type="date"></label>
+  <label><input id="onlySunny" type="checkbox"> Toon alleen “nu zon”</label>
+  <span class="hint">Tip: voeg ?bbox=4.75,52.30,5.02,52.42 aan de URL toe voor “binnen de Ring”.</span>
 </header>
 <div id="map"></div>
 
@@ -26,7 +29,7 @@
 <script>
 const AMS_CENTER=[4.895168,52.370216]; // Dam
 
-// simpele zonstand
+// --- Zonstand (simpel & snel) ---
 function toJulian(d){return(d/86400000)+2440587.5}function toJC(jd){return(jd-2451545)/36525}
 function rad(d){return d*Math.PI/180}function deg(r){return r*180/Math.PI}
 function sunPosition(date, lat, lon){
@@ -46,91 +49,136 @@ function sunPosition(date, lat, lon){
   return { altitude:alt, azimuth:(az+180)%360 };
 }
 
+// --- Kaart ---
 const map=new maplibregl.Map({
   container:'map',
   style:{version:8,
     sources:{osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap'}},
     layers:[{id:'osm',type:'raster',source:'osm'}]},
-  center:AMS_CENTER,zoom:13
+  center:AMS_CENTER, zoom:13
 });
 
-let terraces=null;
-const state={date:new Date()};
+let GEO=null;           // GeoJSON met terrassen
+const state={ date:new Date(), onlySunny:false };
 
-map.on('load', loadTerraces);
+map.on('load', async () => {
+  await loadTerracesAndRender();
+  initControls();
+});
 
-async function loadTerraces(){
+async function loadTerracesAndRender(){
   const info=document.getElementById('info');
   const dataBadge=document.getElementById('dataBadge');
+
+  // bbox uit de URL (optioneel) doorgeven aan je proxy
+  const params=new URLSearchParams(location.search);
+  const bbox=params.get('bbox');
+  const url = bbox ? `/api/terraces?bbox=${encodeURIComponent(bbox)}` : '/api/terraces';
+
   try{
-    const res=await fetch('/api/terraces',{headers:{'Accept':'application/json'}});
+    const res=await fetch(url,{headers:{'Accept':'application/json'}});
     if(!res.ok) throw new Error('HTTP '+res.status);
     const fc=await res.json();
 
-    // badge bron
-    dataBadge.textContent = 'Data: ' + (fc.source ? fc.source.toUpperCase() : '?');
+    dataBadge.textContent = 'Data: ' + (fc.source ? fc.source.toUpperCase() : '?') + ' • ' + (fc.count ?? fc.features.length);
+    GEO = normalizeFeatures(fc);
 
-    // ids/labels zeker stellen
-    fc.features.forEach((f,i)=>{ f.id=f.id||f.properties?.id||i; f.properties=f.properties||{}; f.properties.name=f.properties.name||('Terras #'+(i+1)); });
-
-    terraces=fc;
-    addTerraceLayers(fc);
-    info.textContent=(fc.count ?? fc.features.length)+' terrassen geladen';
+    addOrUpdateLayers(GEO);
+    fitToData(GEO);
+    recomputeColors(); // eerste kleurzetting
+    info.textContent = (fc.count ?? GEO.features.length) + ' terrassen geladen';
   }catch(e){
     info.textContent='Terrassen laden mislukt';
-    document.getElementById('dataBadge').textContent='Data: ?';
+    dataBadge.textContent='Data: ?';
     console.error(e);
   }
 }
 
-function addTerraceLayers(fc){
+function normalizeFeatures(fc){
+  // Zeker stellen: id + name aanwezig
+  fc.features.forEach((f,i)=>{
+    f.id = f.id ?? f.properties?.id ?? i;
+    f.properties = f.properties || {};
+    f.properties.name = f.properties.name || `Terras #${i+1}`;
+  });
+  return fc;
+}
+
+function addOrUpdateLayers(fc){
   if(!map.getSource('terr')) map.addSource('terr',{type:'geojson',data:fc});
   else map.getSource('terr').setData(fc);
 
-  if(!map.getLayer('terr-fill')) map.addLayer({id:'terr-fill',type:'fill',source:'terr',
-    paint:{'fill-color':['case',['boolean',['feature-state','sunny'],false],'#a3e635','#94a3b8'],'fill-opacity':0.65}});
-  if(!map.getLayer('terr-line')) map.addLayer({id:'terr-line',type:'line',source:'terr',paint:{'line-color':'#111','line-width':1.5}});
-  if(!map.getLayer('terr-label')) map.addLayer({id:'terr-label',type:'symbol',source:'terr',
-    layout:{'text-field':['get','name'],'text-size':11,'text-offset':[0,1.1],'text-anchor':'top'},
-    paint:{'text-halo-color':'#fff','text-halo-width':1.2}});
-
-  // fit naar alle features
-  const b=bbox(fc); map.fitBounds([[b[0],b[1]],[b[2],b[3]]],{padding:60,duration:600});
-  recompute();
-}
-
-function bbox(fc){
-  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
-  fc.features.forEach(f=>{
-    const polys = (f.geometry.type==='Polygon') ? [f.geometry.coordinates] : f.geometry.coordinates;
-    polys.forEach(poly=> poly[0].forEach(([x,y])=>{
-      if(x<minx)minx=x; if(y<miny)miny=y; if(x>maxx)maxx=x; if(y>maxy)maxy=y;
-    }));
+  // fill: groen = zon, grijs = schaduw (via feature-state)
+  if(!map.getLayer('terr-fill')) map.addLayer({
+    id:'terr-fill', type:'fill', source:'terr',
+    paint:{
+      'fill-color':['case',['boolean',['feature-state','sunny'],false],'#a3e635','#94a3b8'],
+      'fill-opacity':0.6
+    }
   });
-  return [minx,miny,maxx,maxy];
+  if(!map.getLayer('terr-line')) map.addLayer({
+    id:'terr-line', type:'line', source:'terr',
+    paint:{'line-color':'#111','line-width':1.2}
+  });
+  if(!map.getLayer('terr-label')) map.addLayer({
+    id:'terr-label', type:'symbol', source:'terr',
+    layout:{'text-field':['get','name'],'text-size':11,'text-offset':[0,1.0],'text-anchor':'top'},
+    paint:{'text-halo-color':'#fff','text-halo-width':1.2}
+  });
+
+  // popup
+  map.on('click','terr-fill',(e)=>{
+    const p = e.features[0].properties || {};
+    new maplibregl.Popup().setLngLat(e.lngLat)
+      .setHTML(`<strong>${p.name||'Terras'}</strong>`)
+      .addTo(map);
+  });
 }
 
-function recompute(){
-  if(!terraces) return;
+function fitToData(fc){
+  try{
+    let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+    fc.features.forEach(f=>{
+      const polys = (f.geometry.type==='Polygon') ? [f.geometry.coordinates] : f.geometry.coordinates;
+      polys.forEach(poly=>poly[0].forEach(([x,y])=>{
+        if(x<minx)minx=x; if(y<miny)miny=y; if(x>maxx)maxx=x; if(y>maxy)maxy=y;
+      }));
+    });
+    if(isFinite(minx)) map.fitBounds([[minx,miny],[maxx,maxy]],{padding:60,duration:600});
+  }catch{}
+}
+
+// Kleur alle features o.b.v. zonhoogte (MVP: zonder gebouwoverlast)
+function recomputeColors(){
+  if(!GEO) return;
   const sp=sunPosition(state.date,52.370216,4.895168);
-  const sunOK=sp.altitude>5; // simpele drempel
-  terraces.features.forEach(f=> map.setFeatureState({source:'terr',id:f.id},{sunny:sunOK}) );
+  const sunnyNow = sp.altitude > 5; // simpele drempel
+  GEO.features.forEach(f=>{
+    const isSunny = sunnyNow;
+    map.setFeatureState({source:'terr', id:f.id},{ sunny:isSunny });
+  });
+  // Filter "toon alleen zon" (client-side)
+  map.setFilter('terr-fill', state.onlySunny ? ['==',['feature-state','sunny'],true] : null);
+  map.setFilter('terr-line', state.onlySunny ? ['==',['feature-state','sunny'],true] : null);
+  map.setFilter('terr-label',state.onlySunny ? ['==',['feature-state','sunny'],true] : null);
 }
 
-// tijd/datum UI
-(function controls(){
-  const t=document.getElementById('time'), d=document.getElementById('date');
+// UI
+function initControls(){
+  const t=document.getElementById('time'), d=document.getElementById('date'), only=document.getElementById('onlySunny');
   const now=new Date(), pad=n=>String(n).padStart(2,'0');
   t.value=`${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`;
   d.valueAsDate=new Date(now.getFullYear(),now.getMonth(),now.getDate());
-  function setDT(){
-    const [hh,mm]=(t.value||'12:00').split(':').map(x=>parseInt(x,10));
-    const base=d.valueAsDate||new Date(); state.date=new Date(base.getFullYear(),base.getMonth(),base.getDate(),hh,mm);
-    recompute();
-  }
-  t.addEventListener('input',setDT);
-  d.addEventListener('input',setDT);
-})();
+  const setDT=()=>{
+    const [hh,mm]=(t.value||'12:00').split(':').map(n=>parseInt(n,10));
+    const base=d.valueAsDate||new Date();
+    state.date=new Date(base.getFullYear(),base.getMonth(),base.getDate(),hh,mm);
+    recomputeColors();
+  };
+  t.addEventListener('input', setDT);
+  d.addEventListener('input', setDT);
+  only.addEventListener('change',()=>{ state.onlySunny=only.checked; recomputeColors(); });
+}
 </script>
 </body>
 </html>
