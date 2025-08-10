@@ -6,17 +6,17 @@
   <title>SunTerras — AMS</title>
   <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet">
   <style>
-    html,body {height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
-    header {padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center}
-    #map {position:absolute;inset:52px 0 0 0}
+    html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
+    header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    #map{position:absolute;inset:60px 0 0 0}
     .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
   </style>
 </head>
 <body>
 <header>
   <strong>SunTerras — AMS</strong>
-  <span id="dataBadge">Data: ?</span>
   <span class="badge" id="info">Laden…</span>
+  <span class="badge" id="dataBadge">Data: ?</span>
   <label>Tijd: <input id="time" type="time" step="300"></label>
   <label>Datum: <input id="date" type="date"></label>
 </header>
@@ -26,7 +26,7 @@
 <script>
 const AMS_CENTER=[4.895168,52.370216]; // Dam
 
-// heel simpele zonstand -> hoogte/azimut (MVP)
+// simpele zonstand
 function toJulian(d){return(d/86400000)+2440587.5}function toJC(jd){return(jd-2451545)/36525}
 function rad(d){return d*Math.PI/180}function deg(r){return r*180/Math.PI}
 function sunPosition(date, lat, lon){
@@ -42,33 +42,43 @@ function sunPosition(date, lat, lon){
   const off=date.getTimezoneOffset(), tst=(date.getUTCHours()*60+date.getUTCMinutes()+off+E+4*lon)%1440;
   const ha=(tst/4<0)?tst/4+180:tst/4-180, latr=rad(lat);
   const zen=deg(Math.acos(Math.sin(latr)*Math.sin(rad(decl))+Math.cos(latr)*Math.cos(rad(decl))*Math.cos(rad(ha))));
-  const alt=90-zen;
-  let az=deg(Math.atan2(Math.sin(rad(ha)),Math.cos(rad(ha))*Math.sin(latr)-Math.tan(rad(decl))*Math.cos(latr)));
-  az=(az+180)%360; return{altitude:alt,azimuth:az};
+  const alt=90-zen; let az=deg(Math.atan2(Math.sin(rad(ha)),Math.cos(rad(ha))*Math.sin(latr)-Math.tan(rad(decl))*Math.cos(latr)));
+  return { altitude:alt, azimuth:(az+180)%360 };
 }
 
 const map=new maplibregl.Map({
   container:'map',
-  style:{version:8,sources:{osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap'}},layers:[{id:'osm',type:'raster',source:'osm'}]},
+  style:{version:8,
+    sources:{osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap'}},
+    layers:[{id:'osm',type:'raster',source:'osm'}]},
   center:AMS_CENTER,zoom:13
 });
 
 let terraces=null;
+const state={date:new Date()};
+
+map.on('load', loadTerraces);
 
 async function loadTerraces(){
   const info=document.getElementById('info');
+  const dataBadge=document.getElementById('dataBadge');
   try{
     const res=await fetch('/api/terraces',{headers:{'Accept':'application/json'}});
-    document.getElementById('dataBadge').textContent = 'Data: ' + (fc.source ? fc.source.toUpperCase() : '?');
     if(!res.ok) throw new Error('HTTP '+res.status);
     const fc=await res.json();
-    // Zorg dat features id & name hebben
+
+    // badge bron
+    dataBadge.textContent = 'Data: ' + (fc.source ? fc.source.toUpperCase() : '?');
+
+    // ids/labels zeker stellen
     fc.features.forEach((f,i)=>{ f.id=f.id||f.properties?.id||i; f.properties=f.properties||{}; f.properties.name=f.properties.name||('Terras #'+(i+1)); });
+
     terraces=fc;
-    info.textContent = fc.features.length+' terrassen geladen';
     addTerraceLayers(fc);
+    info.textContent=(fc.count ?? fc.features.length)+' terrassen geladen';
   }catch(e){
     info.textContent='Terrassen laden mislukt';
+    document.getElementById('dataBadge').textContent='Data: ?';
     console.error(e);
   }
 }
@@ -77,37 +87,37 @@ function addTerraceLayers(fc){
   if(!map.getSource('terr')) map.addSource('terr',{type:'geojson',data:fc});
   else map.getSource('terr').setData(fc);
 
-  if(!map.getLayer('terr-fill')) map.addLayer({id:'terr-fill',type:'fill',source:'terr',paint:{
-    'fill-color':['case',['boolean',['feature-state','sunny'],false],'#a3e635','#94a3b8'],
-    'fill-opacity':0.65}});
+  if(!map.getLayer('terr-fill')) map.addLayer({id:'terr-fill',type:'fill',source:'terr',
+    paint:{'fill-color':['case',['boolean',['feature-state','sunny'],false],'#a3e635','#94a3b8'],'fill-opacity':0.65}});
   if(!map.getLayer('terr-line')) map.addLayer({id:'terr-line',type:'line',source:'terr',paint:{'line-color':'#111','line-width':1.5}});
   if(!map.getLayer('terr-label')) map.addLayer({id:'terr-label',type:'symbol',source:'terr',
     layout:{'text-field':['get','name'],'text-size':11,'text-offset':[0,1.1],'text-anchor':'top'},
     paint:{'text-halo-color':'#fff','text-halo-width':1.2}});
 
-  // Zoom naar alles
+  // fit naar alle features
   const b=bbox(fc); map.fitBounds([[b[0],b[1]],[b[2],b[3]]],{padding:60,duration:600});
   recompute();
 }
 
 function bbox(fc){
   let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
-  fc.features.forEach(f=>{ (f.geometry.type==='Polygon'? [f.geometry.coordinates] : f.geometry.coordinates).forEach(poly=>{
-    poly[0].forEach(([x,y])=>{ if(x<minx)minx=x; if(y<miny)miny=y; if(x>maxx)maxx=x; if(y>maxy)maxy=y; });
-  });});
+  fc.features.forEach(f=>{
+    const polys = (f.geometry.type==='Polygon') ? [f.geometry.coordinates] : f.geometry.coordinates;
+    polys.forEach(poly=> poly[0].forEach(([x,y])=>{
+      if(x<minx)minx=x; if(y<miny)miny=y; if(x>maxx)maxx=x; if(y>maxy)maxy=y;
+    }));
+  });
   return [minx,miny,maxx,maxy];
 }
 
 function recompute(){
   if(!terraces) return;
-  const d=state.date, sp=sunPosition(d,52.370216,4.895168);
-  const sunOK = sp.altitude > 5; // simpele drempel voor demo
-  terraces.features.forEach(f=>{
-    map.setFeatureState({source:'terr',id:f.id},{sunny:sunOK});
-  });
+  const sp=sunPosition(state.date,52.370216,4.895168);
+  const sunOK=sp.altitude>5; // simpele drempel
+  terraces.features.forEach(f=> map.setFeatureState({source:'terr',id:f.id},{sunny:sunOK}) );
 }
 
-const state={date:new Date()};
+// tijd/datum UI
 (function controls(){
   const t=document.getElementById('time'), d=document.getElementById('date');
   const now=new Date(), pad=n=>String(n).padStart(2,'0');
@@ -118,10 +128,9 @@ const state={date:new Date()};
     const base=d.valueAsDate||new Date(); state.date=new Date(base.getFullYear(),base.getMonth(),base.getDate(),hh,mm);
     recompute();
   }
-  t.addEventListener('input',setDT); d.addEventListener('input',setDT);
+  t.addEventListener('input',setDT);
+  d.addEventListener('input',setDT);
 })();
-
-map.on('load', loadTerraces);
 </script>
 </body>
 </html>
