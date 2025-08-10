@@ -1,122 +1,42 @@
-<!doctype html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SunTerras — AMS (MVT direct)</title>
-  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-  <style>
-    html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
-    header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    #map{position:absolute;inset:56px 0 0 0}
-    .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
-  </style>
-</head>
-<body>
-<header>
-  <strong>SunTerras — AMS</strong>
-  <span class="badge">Bron: Gemeente Amsterdam MVT</span>
-  <label>Tijd: <input id="time" type="time" step="300"></label>
-  <label>Datum: <input id="date" type="date"></label>
-</header>
-<div id="map"></div>
-
-<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-<script>
-const AMS_CENTER=[4.895168,52.370216]; // Dam
-
-// heel simpele zonstand (voor straks)
-function toJulian(d){return(d/86400000)+2440587.5}function toJC(jd){return(jd-2451545)/36525}
-function rad(d){return d*Math.PI/180}function deg(r){return r*180/Math.PI}
-function sunPosition(date, lat, lon){
-  const jd=toJulian(date),T=toJC(jd);
-  let L0=(280.46646+T*(36000.76983+0.0003032*T))%360; if(L0<0)L0+=360;
-  const M=357.52911+T*(35999.05029-0.0001537*T), e=0.016708634-T*(0.000042037+0.0000001267*T);
-  const C=Math.sin(rad(M))*(1.914602-T*(0.004817+0.000014*T))+Math.sin(rad(2*M))*(0.019993-0.000101*T)+Math.sin(rad(3*M))*0.000289;
-  const trueLong=L0+C, omega=125.04-1934.136*T, lambda=trueLong-0.00569-0.00478*Math.sin(rad(omega));
-  const eps0=23+(26+((21.448-T*(46.815+T*(0.00059-T*0.001813))))/60)/60, eps=eps0+0.00256*Math.cos(rad(omega));
-  const decl=deg(Math.asin(Math.sin(rad(eps))*Math.sin(rad(lambda))));
-  const y=Math.tan(rad(eps/2))*Math.tan(rad(eps/2));
-  const E=4*deg(y*Math.sin(2*rad(L0))-2*e*Math.sin(rad(M))+4*e*y*Math.sin(rad(M))*Math.cos(2*rad(L0))-0.5*y*y*Math.sin(4*rad(L0))-1.25*e*e*Math.sin(2*rad(M)));
-  const off=date.getTimezoneOffset(), tst=(date.getUTCHours()*60+date.getUTCMinutes()+off+E+4*lon)%1440;
-  const ha=(tst/4<0)?tst/4+180:tst/4-180, latr=rad(lat);
-  const zen=deg(Math.acos(Math.sin(latr)*Math.sin(rad(decl))+Math.cos(latr)*Math.cos(rad(decl))*Math.cos(rad(ha))));
-  const alt=90-zen; let az=deg(Math.atan2(Math.sin(rad(ha)),Math.cos(rad(ha))*Math.sin(latr)-Math.tan(rad(decl))*Math.cos(latr)));
-  return { altitude:alt, azimuth:(az+180)%360 };
-}
-
-const map=new maplibregl.Map({
-  container:'map',
-  style:{version:8,
-    sources:{
-      osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap'},
-      // Gemeente Amsterdam horeca-tegelset (MVT tilejson)
-      horeca:{type:'vector', url:'https://api.data.amsterdam.nl/v1/mvt/horeca/tilejson.json'}
-    },
-    layers:[
-      {id:'osm',type:'raster',source:'osm'}
-    ]},
-  center:AMS_CENTER, zoom:13
-});
-
 map.on('load', () => {
-  // Terrassen: features met 'terrasgeometrie' in layer 'exploitatievergunning'
-  map.addLayer({
-    id:'terr-fill',
-    type:'fill',
-    source:'horeca',
-    'source-layer':'exploitatievergunning',
-    filter:['has','terrasgeometrie'],
-    paint:{
-      // voorlopig één kleur: we gebruiken MVT direct (geen proxy/geojson)
-      'fill-color':'#facc15',
-      'fill-opacity':0.55
-    }
+  // 1) Vector tiles (MVT) van Gemeente Amsterdam
+  map.addSource('horeca', {
+    type: 'vector',
+    url: 'https://api.data.amsterdam.nl/v1/mvt/horeca/tilejson.json'
   });
+
+  // 2) Teken ALLES uit 'exploitatievergunning' (zonder filter)
   map.addLayer({
-    id:'terr-outline',
-    type:'line',
-    source:'horeca',
-    'source-layer':'exploitatievergunning',
-    filter:['has','terrasgeometrie'],
-    paint:{'line-color':'#111','line-width':1}
+    id: 'terr-fill',
+    type: 'fill',
+    source: 'horeca',
+    'source-layer': 'exploitatievergunning',
+    paint: { 'fill-color': '#facc15', 'fill-opacity': 0.55 }
   });
+
   map.addLayer({
-    id:'terr-label',
-    type:'symbol',
-    source:'horeca',
-    'source-layer':'exploitatievergunning',
-    filter:['has','terrasgeometrie'],
-    layout:{
-      'text-field':['coalesce',['get','zaaknaam'],['get','naam'],['get','bedrijfsnaam'],['literal','Terras']],
-      'text-size':11,'text-offset':[0,1.0],'text-anchor':'top'
+    id: 'terr-outline',
+    type: 'line',
+    source: 'horeca',
+    'source-layer': 'exploitatievergunning',
+    paint: { 'line-color': '#111', 'line-width': 1 }
+  });
+
+  map.addLayer({
+    id: 'terr-label',
+    type: 'symbol',
+    source: 'horeca',
+    'source-layer': 'exploitatievergunning',
+    layout: {
+      'text-field': ['coalesce',['get','zaaknaam'],['get','naam'],['get','bedrijfsnaam'],['literal','Terras']],
+      'text-size': 11, 'text-offset': [0, 1.0], 'text-anchor': 'top'
     },
-    paint:{'text-halo-color':'#fff','text-halo-width':1.2}
+    paint: { 'text-halo-color': '#fff', 'text-halo-width': 1.2 }
   });
 
-  // Popup
-  map.on('click','terr-fill', (e)=>{
-    const p=e.features[0].properties||{};
-    const naam=p.zaaknaam||p.naam||p.bedrijfsnaam||'Terras';
-    new maplibregl.Popup().setLngLat(e.lngLat).setHTML(`<strong>${naam}</strong>`).addTo(map);
+  // 3) Kleine check: tel zichtbare features en log het
+  map.on('idle', () => {
+    const f = map.queryRenderedFeatures({ layers: ['terr-fill'] });
+    console.log('Zichtbare terrassen (MVT):', f.length);
   });
-
-  // (optioneel) simpele “zon nu” indicatie bovenin
-  const t=document.getElementById('time'), d=document.getElementById('date');
-  const now=new Date(), pad=n=>String(n).padStart(2,'0');
-  t.value=`${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`;
-  d.valueAsDate=new Date(now.getFullYear(),now.getMonth(),now.getDate());
-  function setDT(){
-    const [hh,mm]=(t.value||'12:00').split(':').map(n=>parseInt(n,10));
-    const base=d.valueAsDate||new Date();
-    const when=new Date(base.getFullYear(),base.getMonth(),base.getDate(),hh,mm);
-    const sp=sunPosition(when,52.370216,4.895168);
-    // voor nu geen per-terras schaduw (MVT is streaming); kleur later dynamisch via apart GeoJSON
-    console.log('Zonhoogte',sp.altitude.toFixed(1),'° Azimut',sp.azimuth.toFixed(0),'°');
-  }
-  t.addEventListener('input',setDT); d.addEventListener('input',setDT);
-  setDT();
 });
-</script>
-</body>
-</html>
