@@ -7,9 +7,8 @@ export default async function handler(req, res) {
 
   const headers = { 'Accept': 'application/json' };
   const apiKey = process.env.AMS_API_KEY;
-  if (apiKey) headers['X-Api-Key'] = apiKey; // vereiste header
+  if (apiKey) headers['X-Api-Key'] = apiKey;
 
-  // Gebruik het REST endpoint met GeoJSON output (stabieler dan WFS)
   const REST = 'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
 
   try {
@@ -17,7 +16,6 @@ export default async function handler(req, res) {
     if (!r.ok) return res.status(r.status).json({ error: 'Upstream error', status: r.status });
 
     const data = await r.json();
-    // labels/ids normaliseren
     data.features?.forEach((f, i) => {
       f.properties = f.properties || {};
       const name = f.properties.zaaknaam || f.properties.naam || f.properties.bedrijfsnaam || f.properties.naambedrijf || f.properties.adres;
