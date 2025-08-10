@@ -1,4 +1,4 @@
-// /api/terraces.js — Terrassen-proxy (WFS) + fallback demo, met bron & count
+// /api/terraces.js — Amsterdam terrassen via WFS (brede BBOX) of REST, met key
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -9,13 +9,17 @@ export default async function handler(req, res) {
   const headers = { 'Accept': 'application/json' };
   if (apiKey) headers['X-Api-Key'] = apiKey;
 
+  // Brede BBOX rond groot-Amsterdam (EPSG:4326 lon,lat)
   const WFS =
     'https://api.data.amsterdam.nl/v1/wfs/horeca/?' +
-    'REQUEST=GetFeature&SERVICE=WFS&version=2.0.0' +
+    'SERVICE=WFS&REQUEST=GetFeature&version=2.0.0' +
     '&typenames=exploitatievergunning-terrasgeometrie' +
-    '&BBOX=4.63,52.25,5.06,52.45,urn:ogc:def:crs:EPSG::4326' +
+    '&BBOX=4.55,52.20,5.10,52.50,urn:ogc:def:crs:EPSG::4326' +
     '&outputformat=geojson&srsName=urn:ogc:def:crs:EPSG::4326' +
     '&count=10000';
+
+  // Alternatief REST endpoint (sommige accounts zien hier sneller data)
+  const REST = 'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
 
   const demo = {
     type: 'FeatureCollection',
@@ -27,26 +31,41 @@ export default async function handler(req, res) {
     ]
   };
 
+  async function fetchJSON(url) {
+    const r = await fetch(url, { headers });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }
+
   try {
-    const r = await fetch(WFS, { headers });
-    if (!r.ok) {
-      // upstream error → demo
-      return res.status(200).json({ source:'demo', count: demo.features.length, ...demo });
-    }
-    const data = await r.json();
-    if (!data.features || !Array.isArray(data.features) || data.features.length === 0) {
-      return res.status(200).json({ source:'demo', count: demo.features.length, ...demo });
+    // 1) Probeer WFS (breed gebied)
+    let data = await fetchJSON(WFS);
+    if (data?.features?.length) {
+      data.features.forEach((f, i) => {
+        f.properties = f.properties || {};
+        const name = f.properties.naam || f.properties.bedrijfsnaam || f.properties.zaak || f.properties.naambedrijf || f.properties.zaaknaam || f.properties.adres;
+        f.properties.name = name || `Terras #${i + 1}`;
+        f.id = f.id || f.properties.identificatie || f.properties.uuid || f.properties.id || i;
+      });
+      return res.status(200).json({ source:'wfs', count: data.features.length, ...data });
     }
 
-    data.features.forEach((f, i) => {
-      f.properties = f.properties || {};
-      const name = f.properties.naam || f.properties.bedrijfsnaam || f.properties.zaak || f.properties.naambedrijf || f.properties.zaaknaam || f.properties.adres;
-      f.properties.name = name || `Terras #${i + 1}`;
-      f.id = f.id || f.properties.identificatie || f.properties.uuid || f.properties.id || i;
-    });
+    // 2) Zo niet: probeer REST
+    data = await fetchJSON(REST);
+    if (data?.features?.length) {
+      data.features.forEach((f, i) => {
+        f.properties = f.properties || {};
+        const name = f.properties.zaaknaam || f.properties.naam || f.properties.bedrijfsnaam || f.properties.naambedrijf || f.properties.adres;
+        f.properties.name = name || `Terras #${i + 1}`;
+        f.id = f.id || f.properties.identificatie || f.properties.uuid || f.properties.id || i;
+      });
+      return res.status(200).json({ source:'rest', count: data.features.length, ...data });
+    }
 
-    return res.status(200).json({ source:'wfs', count: data.features.length, ...data });
+    // 3) Nog steeds niets → demo met reden
+    return res.status(200).json({ source:'demo(wfs-empty)', count: demo.features.length, ...demo });
   } catch (e) {
-    return res.status(200).json({ source:'demo', count: demo.features.length, ...demo });
+    // API niet bereikbaar of 401 → demo
+    return res.status(200).json({ source:'demo(error)', error:String(e), count: demo.features.length, ...demo });
   }
 }
