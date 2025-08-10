@@ -59,6 +59,7 @@ async function loadTerraces(){
   const info=document.getElementById('info');
   try{
     const res=await fetch('/api/terraces',{headers:{'Accept':'application/json'}});
+    document.getElementById('dataBadge').textContent = 'Data: ' + (fc.source ? fc.source.toUpperCase() : '?');
     if(!res.ok) throw new Error('HTTP '+res.status);
     const fc=await res.json();
     // Zorg dat features id & name hebben
