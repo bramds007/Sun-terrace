@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SunTerras — Amsterdam</title>
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
+    header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    #map{position:absolute;inset:64px 0 0 0}
+    .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
+  </style>
+</head>
+<body>
+<header>
+  <strong>SunTerras — AMS</strong>
+  <span class="badge" id="info">Laden…</span>
+  <span class="badge" id="dataBadge">Data: ?</span>
+  <label>Tijd: <input id="time" type="time" step="300"></label>
+  <label>Datum: <input id="date" type="date"></label>
+</header>
+<div id="map"></div>
+
+<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+<script>
+// --- zonstand (simpel) ---
+function toJulian(d){return(d/86400000)+2440587.5}function toJC(jd){return(jd-2451545)/36525}
+function rad(d){return d*Math.PI/180}function deg(r){return r*180/Math.PI}
+function sunPosition(date, lat, lon){const jd=toJulian(date),T=toJC(jd);let L0=(280.46646+T*(36000.76983+0.0003032*T))%360; if(L0<0)L0+=360; const M=357.52911+T*(35999.05029-0.0001537*T),e=0.016708634-T*(0.000042037+0.0000001267*T); const C=Math.sin(rad(M))*(1.914602-T*(0.004817+0.000014*T))+Math.sin(rad(2*M))*(0.019993-0.000101*T)+Math.sin(rad(3*M))*0.000289; const tl=L0+C,om=125.04-1934.136*T,lam=tl-0.00569-0.00478*Math.sin(rad(om)); const eps0=23+(26+((21.448-T*(46.815+T*(0.00059-T*0.001813))))/60)/60,eps=eps0+0.00256*Math.cos(rad(om)); const dec=deg(Math.asin(Math.sin(rad(eps))*Math.sin(rad(lam)))); const y=Math.tan(rad(eps/2))*Math.tan(rad(eps/2)); const E=4*deg(y*Math.sin(2*rad(L0))-2*e*Math.sin(rad(M))+4*e*y*Math.sin(rad(M))*Math.cos(2*rad(L0))-0.5*y*y*Math.sin(4*rad(L0))-1.25*e*e*Math.sin(2*rad(M))); const off=date.getTimezoneOffset(),tst=(date.getUTCHours()*60+date.getUTCMinutes()+off+E+4*lon)%1440; const ha=(tst/4<0)?tst/4+180:tst/4-180,latr=rad(lat); const zen=deg(Math.acos(Math.sin(latr)*Math.sin(rad(dec))+Math.cos(latr)*Math.cos(rad(dec))*Math.cos(rad(ha)))); const alt=90-zen; let az=deg(Math.atan2(Math.sin(rad(ha)),Math.cos(rad(ha))*Math.sin(latr)-Math.tan(rad(dec))*Math.cos(latr))); return { altitude:alt, azimuth:(az+180)%360 };}
+
+// --- kaart ---
+const AMS=[4.895168,52.370216];
+const map=new maplibregl.Map({
+  container:'map',
+  style:{version:8,sources:{osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap'}},layers:[{id:'osm',type:'raster',source:'osm'}]},
+  center:AMS, zoom:13
+});
+
+let GEO=null; const state={date:new Date()};
+map.on('load', async ()=>{
+  await loadTerraces(); initControls();
+});
+
+async function loadTerraces(){
+  const info=document.getElementById('info'); const badge=document.getElementById('dataBadge');
+  try{
+    // binnen de Ring (lon/lat bbox) — kun je aanpassen of via ?bbox= toevoegen
+    const params=new URLSearchParams(location.search);
+    const bbox=params.get('bbox') || '4.75,52.30,5.02,52.42';
+    const r=await fetch(`/api/terraces?bbox=${encodeURIComponent(bbox)}`,{headers:{'Accept':'application/json'}});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const fc=await r.json();
+    badge.textContent=`Data: ${(fc.source||'?').toUpperCase()} • ${fc.count ?? (fc.features?.length||0)}`;
+    GEO=normalize(fc); addLayers(GEO); fit(GEO); colorBySun();
+    info.textContent=`${fc.count ?? GEO.features.length} terrassen geladen`;
+  }catch(e){ info.textContent='Terrassen laden mislukt'; badge.textContent='Data: ?'; console.error(e); }
+}
+
+function normalize(fc){ fc.features.forEach((f,i)=>{ f.id=f.id??f.properties?.id??i; f.properties=f.properties||{}; f.properties.name=f.properties.name||`Terras #${i+1}`; }); return fc; }
+
+function addLayers(fc){
+  if(!map.getSource('terr')) map.addSource('terr',{type:'geojson',data:fc}); else map.getSource('terr').setData(fc);
+  if(!map.getLayer('terr-fill')) map.addLayer({id:'terr-fill',type:'fill',source:'terr',paint:{'fill-color':['case',['boolean',['feature-state','sunny'],false],'#22c55e','#cbd5e1'],'fill-opacity':0.6}});
+  if(!map.getLayer('terr-line')) map.addLayer({id:'terr-line',type:'line',source:'terr',paint:{'line-color':'#111','line-width':1.2}});
+  if(!map.getLayer('terr-label')) map.addLayer({id:'terr-label',type:'symbol',source:'terr',layout:{'text-field':['get','name'],'text-size':11,'text-offset':[0,1.0],'text-anchor':'top'},paint:{'text-halo-color':'#fff','text-halo-width':1.2}});
+  map.on('click','terr-fill',e=>{const p=e.features[0].properties||{}; new maplibregl.Popup().setLngLat(e.lngLat).setHTML(`<strong>${p.name||'Terras'}</strong>`).addTo(map);});
+}
+
+function fit(fc){
+  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+  fc.features.forEach(f=>{const polys=(f.geometry.type==='Polygon')?[f.geometry.coordinates]:f.geometry.coordinates; polys.forEach(poly=>poly[0].forEach(([x,y])=>{if(x<minx)minx=x;if(y<miny)miny=y;if(x>maxx)maxx=x;if(y>maxy)maxy=y;}));});
+  if(isFinite(minx)) map.fitBounds([[minx,miny],[maxx,maxy]],{padding:60,duration:600});
+}
+
+function colorBySun(){
+  if(!GEO) return; const sp=sunPosition(state.date,52.370216,4.895168); const sunny=sp.altitude>5;
+  GEO.features.forEach(f=> map.setFeatureState({source:'terr',id:f.id},{sunny}) );
+}
+
+function initControls(){
+  const t=document.getElementById('time'), d=document.getElementById('date'); const now=new Date(), pad=n=>String(n).padStart(2,'0');
+  t.value=`${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`; d.valueAsDate=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  const setDT=()=>{const [hh,mm]=(t.value||'12:00').split(':').map(n=>parseInt(n,10)); const base=d.valueAsDate||new Date(); state.date=new Date(base.getFullYear(),base.getMonth(),base.getDate(),hh,mm); colorBySun();};
+  t.addEventListener('input',setDT); d.addEventListener('input',setDT);
+}
+</script>
+</body>
+</html>
