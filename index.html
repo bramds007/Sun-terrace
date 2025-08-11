@@ -30,31 +30,38 @@
 <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
 
 <script>
-// === Zon-positie (MVP) ===
-function toJulian(d){return(d/86400000)+2440587.5}
-function toJC(jd){return(jd-2451545)/36525}
-function rad(d){return d*Math.PI/180}function deg(r){return r*180/Math.PI}
-function sunPosition(date, lat, lon){
-  const jd=toJulian(date),T=toJC(jd);
-  let L0=(280.46646+T*(36000.76983+0.0003032*T))%360; if(L0<0)L0+=360;
-  const M=357.52911+T*(35999.05029-0.0001537*T), e=0.016708634-T*(0.000042037+0.0000001267*T);
-  const C=Math.sin(rad(M))*(1.914602-T*(0.004817+0.000014*T))+Math.sin(rad(2*M))*(0.019993-0.000101*T)+Math.sin(rad(3*M))*0.000289;
-  const tl=L0+C, om=125.04-1934.136*T, lam=tl-0.00569-0.00478*Math.sin(rad(om));
-  const eps0=23+(26+((21.448-T*(46.815+T*(0.00059-T*0.001813))))/60)/60, eps=eps0+0.00256*Math.cos(rad(om));
-  const dec=deg(Math.asin(Math.sin(rad(eps))*Math.sin(rad(lam))));
-  const y=Math.tan(rad(eps/2))*Math.tan(rad(eps/2));
-  const E=4*deg(y*Math.sin(2*rad(L0))-2*e*Math.sin(rad(M))+4*e*y*Math.sin(rad(M))*Math.cos(2*rad(L0))-0.5*y*y*Math.sin(4*rad(L0))-1.25*e*e*Math.sin(2*rad(M)));
-  const off=date.getTimezoneOffset(),tst=(date.getUTCHours()*60+date.getUTCMinutes()+off+E+4*lon)%1440;
-  const ha=(tst/4<0)?tst/4+180:tst/4-180, latr=rad(lat);
-  const zen=deg(Math.acos(Math.sin(latr)*Math.sin(rad(dec))+Math.cos(latr)*Math.cos(rad(dec))*Math.cos(rad(ha))));
-  const alt=90-zen; let az=deg(Math.atan2(Math.sin(rad(ha)),Math.cos(rad(ha))*Math.sin(latr)-Math.tan(rad(dec))*Math.cos(latr)));
-  return { altitude:alt, azimuth:(az+180)%360 };
+/* ===== Robuuste SunCalc (NOAA-achtig) — geeft altitude/azimuth in graden ===== */
+function toRad(d){return d*Math.PI/180} function toDeg(r){return r*180/Math.PI}
+function getJulian(date){return date/86400000 - date.getTimezoneOffset()/1440 + 2440587.5}
+function solarMeanAnomaly(d){return toRad(357.5291 + 0.98560028*(d-2451545))}
+function eclipticLongitude(M){
+  const C = toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);
+  const P = toRad(102.9372); // perihelion
+  return M + C + P + Math.PI;
 }
-const STATE = { date:new Date(), onlySunny:false };
-const ALT_THRESHOLD = 2.5; // milder: >2.5° = zon
-</script>
+function sunCoords(d){
+  const M = solarMeanAnomaly(d);
+  const L = eclipticLongitude(M);
+  const e = toRad(23.4397); // obliquity
+  return {
+    dec: Math.asin(Math.sin(e)*Math.sin(L)),
+    ra: Math.atan2(Math.cos(e)*Math.sin(L), Math.cos(L))
+  };
+}
+function siderealTime(d, lw){ return toRad((280.16 + 360.9856235*(d-2451545)))-lw; }
+function sunPosition(date, lat, lon){
+  const lw = toRad(-lon), phi = toRad(lat), d = getJulian(date) - 2451545;
+  const c = sunCoords(d);
+  const H = siderealTime(getJulian(date), lw) - c.ra;
+  const alt = Math.asin(Math.sin(phi)*Math.sin(c.dec)+Math.cos(phi)*Math.cos(c.dec)*Math.cos(H));
+  const az  = Math.atan2(Math.sin(H), Math.cos(H)*Math.sin(phi)-Math.tan(c.dec)*Math.cos(phi));
+  return { altitude: toDeg(alt), azimuth: (toDeg(az)+180+360)%360 };
+}
+/* ============================================================================ */
 
-<script>
+const STATE = { date: new Date(), onlySunny: false, altThreshold: 2.5 };
+let POLY_DATA = null, POINT_DATA = null; // we onthouden de GeoJSON zodat feature-state zeker werkt
+
 // === Kaart ===
 const map=new maplibregl.Map({
   container:'map',
@@ -68,21 +75,27 @@ map.on('load', init);
 
 async function init(){
   const info=document.getElementById('info'), badge=document.getElementById('dataBadge');
+
   try{
     const r=await fetch('/api/terraces'); if(!r.ok) throw new Error('HTTP '+r.status);
     const data=await r.json();
-    const polys=data.terracePolys, points=data.placePoints;
+    POLY_DATA  = data.terracePolys;
+    POINT_DATA = data.placePoints;
 
-    badge.textContent = `Data: ${data.source.toUpperCase()} • poly ${polys.features.length} • pt ${points.features.length}`;
+    badge.textContent = `Data: ${data.source.toUpperCase()} • poly ${POLY_DATA.features.length} • pt ${POINT_DATA.features.length}`;
     info.textContent  = `${data.count} items`;
 
     // bronnen
-    map.addSource('terr-polys',{ type:'geojson', data: polys });
-    map.addSource('terr-points',{ type:'geojson', data: points });
+    map.addSource('terr-polys',{ type:'geojson', data: POLY_DATA, promoteId: 'id' });
+    map.addSource('terr-points',{ type:'geojson', data: POINT_DATA, promoteId: 'id' });
 
     // polygon (zon = groen, schaduw = grijs) via feature-state
     map.addLayer({ id:'terr-fill', type:'fill', source:'terr-polys',
-      paint:{ 'fill-color':['case',['boolean',['feature-state','sunny'],false],'#22c55e','#cbd5e1'], 'fill-opacity':0.6 }});
+      paint:{
+        'fill-color':['case',['boolean',['feature-state','sunny'],false],'#22c55e','#cbd5e1'],
+        // opacity wordt dynamisch gezet o.b.v. "alleen zon"
+        'fill-opacity': 0.6
+      }});
     map.addLayer({ id:'terr-outline', type:'line', source:'terr-polys',
       paint:{ 'line-color':'#111','line-width':1 }});
 
@@ -90,6 +103,7 @@ async function init(){
     map.addLayer({ id:'terr-points', type:'circle', source:'terr-points',
       paint:{
         'circle-color':['case',['boolean',['feature-state','sunny'],false],'#22c55e','#cbd5e1'],
+        'circle-opacity': 1.0, // wordt aangepast bij "alleen zon"
         'circle-radius':4,'circle-stroke-width':1,'circle-stroke-color':'#111'
       }});
 
@@ -110,11 +124,11 @@ async function init(){
     map.on('click','terr-points',popup);
 
     // fit naar data
-    fitTo(polys, points);
+    fitTo(POLY_DATA, POINT_DATA);
 
     // UI & zonkleur
-    setupControls(); // zet inputs op "nu" en event listeners
-    recomputeSunColors(); // kleur direct
+    setupControls();     // zet inputs & listeners
+    recomputeSunColors();// kleur direct
   }catch(e){
     info.textContent='Terrassen laden mislukt';
     badge.textContent='Data: ?';
@@ -133,28 +147,27 @@ function fitTo(polys, points){
   if(isFinite(ex[0])) map.fitBounds([[ex[0],ex[1]],[ex[2],ex[3]]],{padding:60,duration:600});
 }
 
-// zet feature-state 'sunny' per feature (MVP: alleen zonhoogte-drempel)
+// Zet feature-state 'sunny' en pas laag-opacities aan (ipv filter)
 function recomputeSunColors(){
   const AMS_LAT = 52.370216, AMS_LON = 4.895168;
   const sp = sunPosition(STATE.date, AMS_LAT, AMS_LON);
-  const isSunny = sp.altitude > ALT_THRESHOLD;
+  const isSunny = sp.altitude > STATE.altThreshold;
 
-  const polySrc = map.getSource('terr-polys')? map.getSource('terr-polys')._data : null;
-  const ptSrc   = map.getSource('terr-points')? map.getSource('terr-points')._data : null;
+  // feature-state zetten op basis van onze bewaarde data (zeker ids aanwezig)
+  if (POLY_DATA)  POLY_DATA.features.forEach(f => map.setFeatureState({source:'terr-polys', id:f.id},{sunny:isSunny}));
+  if (POINT_DATA) POINT_DATA.features.forEach(f => map.setFeatureState({source:'terr-points', id:f.id},{sunny:isSunny}));
 
-  if (polySrc) polySrc.features.forEach(f=>{
-    map.setFeatureState({ source:'terr-polys', id:f.id }, { sunny: isSunny });
-  });
-  if (ptSrc) ptSrc.features.forEach(f=>{
-    map.setFeatureState({ source:'terr-points', id:f.id }, { sunny: isSunny });
-  });
+  // “alleen zon”: maak schaduw transparant via opacity (filters kunnen geen feature-state lezen)
+  if (STATE.onlySunny){
+    map.setPaintProperty('terr-fill',   'fill-opacity',   ['case',['boolean',['feature-state','sunny'],false],0.6,0.0]);
+    map.setPaintProperty('terr-points', 'circle-opacity', ['case',['boolean',['feature-state','sunny'],false],1.0,0.0]);
+    // labels laten we staan; kan ook dicht als je wilt
+  } else {
+    map.setPaintProperty('terr-fill',   'fill-opacity', 0.6);
+    map.setPaintProperty('terr-points', 'circle-opacity', 1.0);
+  }
 
-  const filter = STATE.onlySunny ? ['==',['feature-state','sunny'], true] : null;
-  ['terr-fill','terr-outline','terr-label-polys','terr-points','terr-label-pts'].forEach(id=>{
-    if (map.getLayer(id)) map.setFilter(id, filter);
-  });
-
-  // update zon-badge
+  // badge bijwerken
   const b=document.getElementById('sunBadge');
   if (b) b.textContent = `Zon: alt ${sp.altitude.toFixed(1)}° • az ${Math.round(sp.azimuth)}° • ${isSunny?'🌞':'⛅︎'}`;
 }
@@ -165,15 +178,15 @@ function setupControls(){
   const only=document.getElementById('onlySunny');
   const btnNow=document.getElementById('btnNow');
 
-  // zet direct op lokale "nu"
+  // start bewust op 13:00 lokale tijd → grote kans op zon
   const now=new Date();
   const pad=n=>String(n).padStart(2,'0');
-  if (t) t.value = `${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`;
+  if (t) t.value = '13:00';
   if (d) d.valueAsDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  STATE.date = now;
+  STATE.date = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 13, 0);
 
   function updateDT(){
-    const [hh,mm]=(t.value||'12:00').split(':').map(n=>parseInt(n,10));
+    const [hh,mm]=(t.value||'13:00').split(':').map(n=>parseInt(n,10));
     const base=d.valueAsDate||new Date();
     STATE.date = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hh, mm);
     recomputeSunColors();
@@ -189,6 +202,8 @@ function setupControls(){
     STATE.date = n;
     recomputeSunColors();
   });
+
+  // eerste run is al gezet in init()
 }
 </script>
 </body>
