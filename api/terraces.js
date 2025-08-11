@@ -1,12 +1,10 @@
-// /api/terraces.js — REST paging; extract terrace polygons if available
+// /api/terraces.js — REST paging; polygons uit 'terrasgeometrie' + puntenfallback
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const bbox = url.searchParams.get('bbox') || '4.75,52.30,5.02,52.42'; // binnen de Ring
   const START = 'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
 
   const fetchJSON = async (u) => {
@@ -20,6 +18,7 @@ export default async function handler(req, res) {
     while (next && guard++ < 30) {
       const page = await fetchJSON(next);
       if (page?.features?.length) all.features.push(...page.features);
+      // vind "next"
       next = null;
       if (page?.links) {
         const n = page.links.find(l => (l.rel || '').toLowerCase() === 'next'); if (n?.href) next = n.href;
@@ -30,12 +29,12 @@ export default async function handler(req, res) {
     return all;
   };
 
-  // 1) Get everything (we’ll filter client-side by bbox already on the page load)
+  // 1) Alles ophalen (paging)
   let all;
   try {
     all = await restPaged(START);
   } catch (e) {
-    // final ultra-small demo fallback
+    // mini demo fallback
     const demo = {
       type: 'FeatureCollection',
       features: [
@@ -43,25 +42,22 @@ export default async function handler(req, res) {
         { type:'Feature', id:'waterkant', properties:{ name:'Waterkant (demo)'     }, geometry:{ type:'Polygon', coordinates:[[[4.88061,52.36759],[4.88084,52.36759],[4.88084,52.36748],[4.88061,52.36748],[4.88061,52.36759]]] } }
       ]
     };
-    return res.status(200).json({ source: 'demo', bbox, count: demo.features.length, terracePolys: demo, placePoints: { type:'FeatureCollection', features: [] }});
+    return res.status(200).json({ source: 'demo', count: demo.features.length, terracePolys: demo, placePoints: { type:'FeatureCollection', features: [] }});
   }
 
-  // 2) Normalize names & split into polygons/points
+  // 2) Namen normaliseren + split: polygons/points
   const polys = { type: 'FeatureCollection', features: [] };
   const points = { type: 'FeatureCollection', features: [] };
 
-  let idx = 0;
+  let i = 0;
   for (const f of (all.features || [])) {
     const p = f.properties || {};
-    const name = p.zaaknaam || p.naam || p.bedrijfsnaam || p.adres || `Terras #${++idx}`;
-    const id = f.id || p.identificatie || p.uuid || p.id || idx;
+    const name = p.zaaknaam || p.naam || p.bedrijfsnaam || p.adres || `Terras #${++i}`;
+    const id = f.id || p.identificatie || p.uuid || p.id || i;
 
-    // Try to read terrace geometry from properties
+    // terrasgeometrie kan object of stringified GeoJSON zijn
     let tg = p.terrasgeometrie || p.terras_geometrie || p.terrassen_geometrie;
-    // Sometimes API delivers embedded GeoJSON object; if it's a string, try JSON.parse
-    if (typeof tg === 'string') {
-      try { const maybe = JSON.parse(tg); if (maybe && maybe.type) tg = maybe; } catch {}
-    }
+    if (typeof tg === 'string') { try { const j = JSON.parse(tg); if (j && j.type) tg = j; } catch {} }
 
     if (tg && tg.type && (tg.type === 'Polygon' || tg.type === 'MultiPolygon')) {
       polys.features.push({ type:'Feature', id, properties:{ name, source:'poly' }, geometry: tg });
@@ -72,8 +68,7 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     source: 'rest',
-    bbox,
-    count: (polys.features.length + points.features.length),
+    count: polys.features.length + points.features.length,
     terracePolys: polys,
     placePoints: points
   });
