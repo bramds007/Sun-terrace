@@ -1,4 +1,4 @@
-// /api/terraces.js — REST paging; polygons uit 'terrasgeometrie' + puntenfallback
+// /api/terraces.js — REST paging; polygons uit 'terrasgeometrie' + puntenfallback (zonder dubbels)
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -18,7 +18,7 @@ export default async function handler(req, res) {
     while (next && guard++ < 30) {
       const page = await fetchJSON(next);
       if (page?.features?.length) all.features.push(...page.features);
-      // vind "next"
+      // vind "next" (3 varianten)
       next = null;
       if (page?.links) {
         const n = page.links.find(l => (l.rel || '').toLowerCase() === 'next'); if (n?.href) next = n.href;
@@ -45,9 +45,12 @@ export default async function handler(req, res) {
     return res.status(200).json({ source: 'demo', count: demo.features.length, terracePolys: demo, placePoints: { type:'FeatureCollection', features: [] }});
   }
 
-  // 2) Namen normaliseren + split: polygons/points
+  // 2) Namen normaliseren + split: polygons/points + dedup
   const polys = { type: 'FeatureCollection', features: [] };
   const points = { type: 'FeatureCollection', features: [] };
+
+  // om dubbels te voorkomen (veel punten horen bij hetzelfde terras als polygon)
+  const polyKeys = new Set();
 
   let i = 0;
   for (const f of (all.features || [])) {
@@ -61,8 +64,13 @@ export default async function handler(req, res) {
 
     if (tg && tg.type && (tg.type === 'Polygon' || tg.type === 'MultiPolygon')) {
       polys.features.push({ type:'Feature', id, properties:{ name, source:'poly' }, geometry: tg });
+      polyKeys.add(id);
+      polyKeys.add(name); // extra guard wanneer id ontbreekt
     } else if (f.geometry && f.geometry.type === 'Point') {
-      points.features.push({ type:'Feature', id, properties:{ name, source:'point' }, geometry: f.geometry });
+      // sla punt over als er al een polygon met zelfde id of naam is
+      if (!polyKeys.has(id) && !polyKeys.has(name)) {
+        points.features.push({ type:'Feature', id, properties:{ name, source:'point' }, geometry: f.geometry });
+      }
     }
   }
 
