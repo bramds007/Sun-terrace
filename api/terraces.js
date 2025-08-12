@@ -1,11 +1,19 @@
-// /api/terraces.js — REST paging; polygons uit 'terrasgeometrie' + puntenfallback (zonder dubbels)
+// /api/terraces.js — haalt terrassen binnen bbox op (REST), splitst polygons & punten, dedup
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const START = 'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
+  // bbox=lonMin,latMin,lonMax,latMax (WGS84)
+  const bbox = (req.query.bbox || '').split(',').map(Number);
+  if (bbox.length !== 4 || bbox.some(isNaN)) {
+    return res.status(400).json({ error: 'Missing or invalid bbox param. Use ?bbox=lonMin,latMin,lonMax,latMax' });
+  }
+  const [minx, miny, maxx, maxy] = bbox;
+  const poly = { type:'Polygon', coordinates:[[[minx,miny],[maxx,miny],[maxx,maxy],[minx,maxy],[minx,miny]]] };
+
+  const START = `https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson&terrasgeometrie[intersects]=${encodeURIComponent(JSON.stringify(poly))}`;
 
   const fetchJSON = async (u) => {
     const r = await fetch(u, { headers: { 'Accept': 'application/geo+json' } });
@@ -13,15 +21,15 @@ export default async function handler(req, res) {
     return r.json();
   };
 
+  // REST paging
   const restPaged = async (startUrl) => {
-    let next = startUrl, all = { type: 'FeatureCollection', features: [] }, guard = 0;
+    let next = startUrl, all = { type:'FeatureCollection', features:[] }, guard = 0;
     while (next && guard++ < 30) {
       const page = await fetchJSON(next);
       if (page?.features?.length) all.features.push(...page.features);
-      // vind "next" (3 varianten)
       next = null;
       if (page?.links) {
-        const n = page.links.find(l => (l.rel || '').toLowerCase() === 'next'); if (n?.href) next = n.href;
+        const n = page.links.find(l => (l.rel || '').toLowerCase()==='next'); if (n?.href) next = n.href;
       }
       if (!next && page?._links?.next?.href) next = page._links.next.href;
       if (!next && typeof page?.next === 'string') next = page.next;
@@ -29,52 +37,37 @@ export default async function handler(req, res) {
     return all;
   };
 
-  // 1) Alles ophalen (paging)
+  // Ophalen + normaliseren
   let all;
-  try {
-    all = await restPaged(START);
-  } catch (e) {
-    // mini demo fallback
-    const demo = {
-      type: 'FeatureCollection',
-      features: [
-        { type:'Feature', id:'jaren',     properties:{ name:'Café de Jaren (demo)' }, geometry:{ type:'Polygon', coordinates:[[[4.89451,52.36620],[4.89475,52.36620],[4.89475,52.36608],[4.89451,52.36608],[4.89451,52.36620]]] } },
-        { type:'Feature', id:'waterkant', properties:{ name:'Waterkant (demo)'     }, geometry:{ type:'Polygon', coordinates:[[[4.88061,52.36759],[4.88084,52.36759],[4.88084,52.36748],[4.88061,52.36748],[4.88061,52.36759]]] } }
-      ]
-    };
-    return res.status(200).json({ source: 'demo', count: demo.features.length, terracePolys: demo, placePoints: { type:'FeatureCollection', features: [] }});
-  }
+  try { all = await restPaged(START); }
+  catch (e) { return res.status(500).json({ source:'rest', error: e.message }); }
 
-  // 2) Namen normaliseren + split: polygons/points + dedup
-  const polys = { type: 'FeatureCollection', features: [] };
-  const points = { type: 'FeatureCollection', features: [] };
-
-  // om dubbels te voorkomen (veel punten horen bij hetzelfde terras als polygon)
+  const polys  = { type:'FeatureCollection', features:[] };
+  const points = { type:'FeatureCollection', features:[] };
   const polyKeys = new Set();
-
   let i = 0;
+
   for (const f of (all.features || [])) {
     const p = f.properties || {};
     const name = p.zaaknaam || p.naam || p.bedrijfsnaam || p.adres || `Terras #${++i}`;
-    const id = f.id || p.identificatie || p.uuid || p.id || i;
+    const id   = f.id || p.identificatie || p.uuid || p.id || i;
 
     // terrasgeometrie kan object of stringified GeoJSON zijn
     let tg = p.terrasgeometrie || p.terras_geometrie || p.terrassen_geometrie;
-    if (typeof tg === 'string') { try { const j = JSON.parse(tg); if (j && j.type) tg = j; } catch {} }
+    if (typeof tg === 'string') { try { const j = JSON.parse(tg); if (j?.type) tg = j; } catch {} }
 
-    if (tg && tg.type && (tg.type === 'Polygon' || tg.type === 'MultiPolygon')) {
-      polys.features.push({ type:'Feature', id, properties:{ name, source:'poly' }, geometry: tg });
-      polyKeys.add(id);
-      polyKeys.add(name); // extra guard wanneer id ontbreekt
-    } else if (f.geometry && f.geometry.type === 'Point') {
-      // sla punt over als er al een polygon met zelfde id of naam is
+    if (tg && (tg.type==='Polygon' || tg.type==='MultiPolygon')) {
+      polys.features.push({ type:'Feature', id, properties:{ name }, geometry: tg });
+      polyKeys.add(id); polyKeys.add(name);
+    } else if (f.geometry?.type === 'Point') {
+      // skip punt als er al polygon met zelfde id/naam is
       if (!polyKeys.has(id) && !polyKeys.has(name)) {
-        points.features.push({ type:'Feature', id, properties:{ name, source:'point' }, geometry: f.geometry });
+        points.features.push({ type:'Feature', id, properties:{ name }, geometry: f.geometry });
       }
     }
   }
 
-  return res.status(200).json({
+  res.status(200).json({
     source: 'rest',
     count: polys.features.length + points.features.length,
     terracePolys: polys,
