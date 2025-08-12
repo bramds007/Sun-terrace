@@ -1,19 +1,11 @@
-// /api/terraces.js — haalt terrassen binnen bbox op (REST), splitst polygons & punten, dedup
+// /api/terraces.js — HAALT ALLES OP (GEEN BBOX), splitst terras-polygons & punten, verwijdert dubbels
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin','*');
-  res.setHeader('Access-Control-Allow-Methods','GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers','Content-Type');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  // bbox=lonMin,latMin,lonMax,latMax (WGS84)
-  const bbox = (req.query.bbox || '').split(',').map(Number);
-  if (bbox.length !== 4 || bbox.some(isNaN)) {
-    return res.status(400).json({ error: 'Missing or invalid bbox param. Use ?bbox=lonMin,latMin,lonMax,latMax' });
-  }
-  const [minx, miny, maxx, maxy] = bbox;
-  const poly = { type:'Polygon', coordinates:[[[minx,miny],[maxx,miny],[maxx,maxy],[minx,maxy],[minx,miny]]] };
-
-  const START = `https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson&terrasgeometrie[intersects]=${encodeURIComponent(JSON.stringify(poly))}`;
+  const START = 'https://api.data.amsterdam.nl/v1/horeca/exploitatievergunning?_format=geojson';
 
   const fetchJSON = async (u) => {
     const r = await fetch(u, { headers: { 'Accept': 'application/geo+json' } });
@@ -21,15 +13,17 @@ export default async function handler(req, res) {
     return r.json();
   };
 
-  // REST paging
+  // Pagineren tot alles binnen is (max ~30 pagina's)
   const restPaged = async (startUrl) => {
-    let next = startUrl, all = { type:'FeatureCollection', features:[] }, guard = 0;
+    let next = startUrl, all = { type: 'FeatureCollection', features: [] }, guard = 0;
     while (next && guard++ < 30) {
       const page = await fetchJSON(next);
       if (page?.features?.length) all.features.push(...page.features);
+
+      // "next" zoeken (meerdere varianten)
       next = null;
       if (page?.links) {
-        const n = page.links.find(l => (l.rel || '').toLowerCase()==='next'); if (n?.href) next = n.href;
+        const n = page.links.find(l => (l.rel || '').toLowerCase() === 'next'); if (n?.href) next = n.href;
       }
       if (!next && page?._links?.next?.href) next = page._links.next.href;
       if (!next && typeof page?.next === 'string') next = page.next;
@@ -37,16 +31,18 @@ export default async function handler(req, res) {
     return all;
   };
 
-  // Ophalen + normaliseren
   let all;
-  try { all = await restPaged(START); }
-  catch (e) { return res.status(500).json({ source:'rest', error: e.message }); }
+  try {
+    all = await restPaged(START);
+  } catch (e) {
+    return res.status(500).json({ source: 'rest', error: e.message });
+  }
 
-  const polys  = { type:'FeatureCollection', features:[] };
-  const points = { type:'FeatureCollection', features:[] };
-  const polyKeys = new Set();
+  const polys  = { type: 'FeatureCollection', features: [] };
+  const points = { type: 'FeatureCollection', features: [] };
+  const polyKeys = new Set(); // om dubbele punten te schrappen als er al polygon is
+
   let i = 0;
-
   for (const f of (all.features || [])) {
     const p = f.properties || {};
     const name = p.zaaknaam || p.naam || p.bedrijfsnaam || p.adres || `Terras #${++i}`;
@@ -54,15 +50,14 @@ export default async function handler(req, res) {
 
     // terrasgeometrie kan object of stringified GeoJSON zijn
     let tg = p.terrasgeometrie || p.terras_geometrie || p.terrassen_geometrie;
-    if (typeof tg === 'string') { try { const j = JSON.parse(tg); if (j?.type) tg = j; } catch {} }
+    if (typeof tg === 'string') { try { const j = JSON.parse(tg); if (j && j.type) tg = j; } catch {} }
 
-    if (tg && (tg.type==='Polygon' || tg.type==='MultiPolygon')) {
-      polys.features.push({ type:'Feature', id, properties:{ name }, geometry: tg });
+    if (tg && (tg.type === 'Polygon' || tg.type === 'MultiPolygon')) {
+      polys.features.push({ type: 'Feature', id, properties: { name }, geometry: tg });
       polyKeys.add(id); polyKeys.add(name);
-    } else if (f.geometry?.type === 'Point') {
-      // skip punt als er al polygon met zelfde id/naam is
+    } else if (f.geometry && f.geometry.type === 'Point') {
       if (!polyKeys.has(id) && !polyKeys.has(name)) {
-        points.features.push({ type:'Feature', id, properties:{ name }, geometry: f.geometry });
+        points.features.push({ type: 'Feature', id, properties: { name }, geometry: f.geometry });
       }
     }
   }
