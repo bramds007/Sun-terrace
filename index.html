@@ -8,8 +8,9 @@
   <style>
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
     header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    #map{position:absolute;inset:60px 0 0 0}
+    #map{position:absolute;inset:64px 0 0 0}
     .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
+    .btn{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}
   </style>
 </head>
 <body>
@@ -17,18 +18,50 @@
   <strong>SunTerras — AMS</strong>
   <span class="badge" id="info">Laden…</span>
   <span class="badge" id="dataBadge">Data: ?</span>
+
+  <label>Tijd: <input id="time" type="time" step="300" /></label>
+  <label>Datum: <input id="date" type="date" /></label>
+  <button class="btn" id="btnNow">Nu</button>
+  <span class="badge" id="sunBadge">Zon: …</span>
 </header>
 <div id="map"></div>
 
 <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+
 <script>
+/* ===== Zonstand (robuuste berekening; geeft graden) ===== */
+function toRad(d){return d*Math.PI/180} function toDeg(r){return r*180/Math.PI}
+function getJulian(date){return date/86400000 - date.getTimezoneOffset()/1440 + 2440587.5}
+function solarMeanAnomaly(d){return toRad(357.5291 + 0.98560028*(d-2451545))}
+function eclipticLongitude(M){
+  const C=toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);
+  const P=toRad(102.9372); return M+C+P+Math.PI;
+}
+function sunCoords(d){const M=solarMeanAnomaly(d),L=eclipticLongitude(M),e=toRad(23.4397);
+  return {dec:Math.asin(Math.sin(e)*Math.sin(L)), ra:Math.atan2(Math.cos(e)*Math.sin(L),Math.cos(L))};}
+function siderealTime(d,lw){return toRad((280.16+360.9856235*(d-2451545)))-lw;}
+function sunPosition(date, lat, lon){
+  const lw=toRad(-lon), phi=toRad(lat), d=getJulian(date)-2451545, c=sunCoords(d);
+  const H=siderealTime(getJulian(date),lw)-c.ra;
+  const alt=Math.asin(Math.sin(phi)*Math.sin(c.dec)+Math.cos(phi)*Math.cos(c.dec)*Math.cos(H));
+  const az=Math.atan2(Math.sin(H), Math.cos(H)*Math.sin(phi)-Math.tan(c.dec)*Math.cos(phi));
+  return { altitude: toDeg(alt), azimuth: (toDeg(az)+180+360)%360 };
+}
+
+/* ===== App state ===== */
+const AMS = { lon: 4.895168, lat: 52.370216 };
+let TERR_POLY=null, TERR_PTS=null;
+</script>
+
+<script>
+/* ===== Kaart tekenen (ongewijzigd) ===== */
 const map = new maplibregl.Map({
   container: 'map',
   style: { version: 8,
     sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, attribution: '© OpenStreetMap' } },
     layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
   },
-  center: [4.895168, 52.370216], zoom: 13
+  center: [AMS.lon, AMS.lat], zoom: 13
 });
 map.addControl(new maplibregl.NavigationControl());
 
@@ -39,18 +72,16 @@ async function init(){
   const badge=document.getElementById('dataBadge');
 
   try {
-    const r = await fetch('/api/terraces'); // HAAL ALLES OP (GEEN BBOX)
+    const r = await fetch('/api/terraces'); // ALLES ophalen (geen bbox)
     if (!r.ok) throw new Error('HTTP '+r.status);
     const data = await r.json();
 
-    const polys  = data.terracePolys || { type:'FeatureCollection', features:[] };
-    const points = data.placePoints  || { type:'FeatureCollection', features:[] };
+    TERR_POLY  = data.terracePolys || { type:'FeatureCollection', features:[] };
+    TERR_PTS   = data.placePoints  || { type:'FeatureCollection', features:[] };
 
-    // bronnen
-    map.addSource('terr-polys',  { type:'geojson', data: polys  });
-    map.addSource('terr-points', { type:'geojson', data: points });
+    map.addSource('terr-polys',  { type:'geojson', data: TERR_POLY });
+    map.addSource('terr-points', { type:'geojson', data: TERR_PTS });
 
-    // lagen
     map.addLayer({ id:'terr-fill', type:'fill', source:'terr-polys',
       paint:{ 'fill-color':'#22c55e', 'fill-opacity':0.55 }});
     map.addLayer({ id:'terr-outline', type:'line', source:'terr-polys',
@@ -64,7 +95,6 @@ async function init(){
       layout:{ 'text-field':['get','name'], 'text-size':11, 'text-offset':[0,1.0], 'text-anchor':'top' },
       paint:{ 'text-halo-color':'#fff', 'text-halo-width':1.2 }});
 
-    // popup
     const popup = (e) => {
       const p = e.features[0].properties || {};
       new maplibregl.Popup().setLngLat(e.lngLat)
@@ -74,10 +104,13 @@ async function init(){
     map.on('click','terr-fill',popup);
     map.on('click','terr-points',popup);
 
-    // badge + fit
-    badge.textContent = `Data: REST • poly ${polys.features.length} • pt ${points.features.length}`;
+    badge.textContent = `Data: REST • poly ${TERR_POLY.features.length} • pt ${TERR_PTS.features.length}`;
     info.textContent = 'OK';
-    fitTo(polys, points);
+    fitTo(TERR_POLY, TERR_PTS);
+
+    // Zon UI initialiseren (alleen badge updaten)
+    setupSunControls();
+    updateSunBadge();
   } catch (e) {
     info.textContent = 'Terrassen laden mislukt';
     badge.textContent = 'Data: ?';
@@ -94,6 +127,44 @@ function fitTo(polys, points){
   });
   (points.features||[]).forEach(f=> bump(f.geometry.coordinates));
   if (isFinite(ex[0])) map.fitBounds([[ex[0],ex[1]],[ex[2],ex[3]]], { padding:60, duration:600 });
+}
+
+/* ===== Alleen de zon-badge + inputs ===== */
+function setupSunControls(){
+  const t=document.getElementById('time');
+  const d=document.getElementById('date');
+  const btnNow=document.getElementById('btnNow');
+
+  // standaard: NU (lokaal)
+  const now = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  if (t) t.value = `${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`;
+  if (d) d.valueAsDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  function onChange(){
+    updateSunBadge();
+  }
+  t.addEventListener('input', onChange);
+  d.addEventListener('input', onChange);
+  btnNow.addEventListener('click', ()=>{
+    const n=new Date();
+    if (t) t.value = `${pad(n.getHours())}:${pad(n.getMinutes()-n.getMinutes()%5)}`;
+    if (d) d.valueAsDate = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+    updateSunBadge();
+  });
+}
+
+function updateSunBadge(){
+  const t=document.getElementById('time');
+  const d=document.getElementById('date');
+  const b=document.getElementById('sunBadge');
+
+  const base = d.valueAsDate || new Date();
+  const [hh,mm] = (t.value||'12:00').split(':').map(x=>parseInt(x,10));
+  const when = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hh||12, mm||0);
+
+  const sp = sunPosition(when, AMS.lat, AMS.lon);
+  b.textContent = `Zon: alt ${sp.altitude.toFixed(1)}° • az ${Math.round(sp.azimuth)}°`;
 }
 </script>
 </body>
