@@ -1,7 +1,5 @@
-// /api/buildings.js — 3DBAG WFS with RD bbox (EPSG:28992) → WGS84 output (EPSG:4326)
-// Robust: uses 'typenames', count=5000, and falls back to lod12 if lod13 yields 0.
-
-const WFS = 'https://data.3dbag.nl/api/BAG3D/wfs';
+// /api/buildings.js — haalt gebouwen uit OpenStreetMap (Overpass API) binnen WGS84 bbox
+// Zet 'height' of 'building:levels' om naar h_m (meters). Geeft GeoJSON terug.
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin','*');
@@ -9,102 +7,132 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers','Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const bboxWgs = (req.query.bbox || '').split(',').map(Number);
-  if (bboxWgs.length !== 4 || bboxWgs.some(isNaN)) {
+  // Verwacht bbox=lonMin,latMin,lonMax,latMax (WGS84)
+  const bbox = (req.query.bbox || '').split(',').map(Number);
+  if (bbox.length !== 4 || bbox.some(isNaN)) {
     return res.status(400).json({ error: 'Use ?bbox=lonMin,latMin,lonMax,latMax (WGS84)' });
   }
-  const [lonMin, latMin, lonMax, latMax] = bboxWgs;
+  const [lonMin, latMin, lonMax, latMax] = bbox;
 
-  // Convert to RD (EPSG:28992)
-  const [xMin, yMin] = wgs84ToRd(lonMin, latMin);
-  const [xMax, yMax] = wgs84ToRd(lonMax, latMax);
-  const bboxRd = [
-    Math.min(xMin, xMax),
-    Math.min(yMin, yMax),
-    Math.max(xMin, xMax),
-    Math.max(yMin, yMax)
-  ];
+  // Overpass QL: alle building ways/relations binnen bbox, met tags en geometrie
+  // NB: we houden het compact en vragen alleen wat we nodig hebben.
+  const ql = `
+    [out:json][timeout:25];
+    (
+      way["building"](${latMin},${lonMin},${latMax},${lonMax});
+      relation["building"](${latMin},${lonMin},${latMax},${lonMax});
+    );
+    out tags geom;
+  `.trim();
 
-  // Try lod13 first, then fallback to lod12 if zero
-  const tries = ['lod13', 'lod12'];
-  let gj = null, usedType = null, lastErr = null, urlTried = [];
+  try {
+    const r = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body: new URLSearchParams({ data: ql })
+    });
+    if (!r.ok) throw new Error(`Overpass HTTP ${r.status}`);
 
-  for (const tname of tries) {
-    const url = `${WFS}?service=WFS&version=2.0.0&request=GetFeature`
-      + `&typenames=${encodeURIComponent(tname)}`
-      + `&bbox=${bboxRd.join(',')},EPSG:28992`
-      + `&srsName=EPSG:4326`
-      + `&outputFormat=application/json`
-      + `&count=5000`;
-    urlTried.push({ tname, url });
+    const json = await r.json();
+    const fc = overpassToGeoJSON(json);
 
-    try {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`WFS HTTP ${r.status}`);
-      const j = await r.json();
-      // if server responds with nested object for GeoJSON, normalize keys
-      const feats = Array.isArray(j?.features) ? j.features : [];
-      if (feats.length > 0) {
-        gj = j; usedType = tname; break;
-      } else {
-        // keep trying next typenames
-        gj = j;
+    // Hoogteveld h_m toevoegen uit tags.height of tags["building:levels"]
+    for (const f of fc.features) {
+      const tags = f.properties?.tags || {};
+      let h = parseHeight(tags.height);
+      if (h == null) {
+        const lvl = toNum(tags["building:levels"]);
+        if (lvl != null) h = lvl * 3.2; // ruwe schatting: 3.2 m per verdieping
       }
-    } catch (e) {
-      lastErr = e.message;
+      f.properties = { ...f.properties, h_m: (h != null ? h : null) };
     }
-  }
 
-  // If still nothing, return empty but include debug info
-  if (!gj) {
     return res.status(200).json({
-      source: '3dbag-wfs',
-      error: lastErr || 'no features',
-      buildings: emptyFC(),
-      debug: { bboxWgs, bboxRd, urlTried }
+      source: 'osm-overpass',
+      count: fc.features.length,
+      buildings: fc
+    });
+  } catch (e) {
+    // Fallback: lege set zodat frontend blijft draaien (valt dan terug op "globale zon")
+    return res.status(200).json({
+      source: 'osm-overpass',
+      error: e.message,
+      buildings: { type:'FeatureCollection', features:[] }
     });
   }
-
-  // Add h_m (height above ground) if possible
-  for (const f of (gj.features || [])) {
-    const p = f.properties || {};
-    const hRoof = toNum(p.b3_h_dak_max);
-    const hGround = toNum(p.b3_h_maaiveld);
-    const h = (hRoof != null && hGround != null) ? Math.max(0, hRoof - hGround) : null;
-    f.properties = { ...p, h_m: h };
-  }
-
-  return res.status(200).json({
-    source: '3dbag-wfs',
-    count: gj.features?.length || 0,
-    buildings: gj,
-    debug: { bboxWgs, bboxRd, usedType, urlTried }
-  });
 }
 
-function emptyFC(){ return { type:'FeatureCollection', features:[] }; }
-function toNum(v){ const n = Number(v); return Number.isFinite(n) ? n : null; }
+// ---- Helpers ----
 
-/* === WGS84 -> RD (EPSG:28992) conversion (approx; good for bbox) === */
-function wgs84ToRd(lon, lat){
-  const dPhi = (lat  - 52.15517440) / 0.00001;
-  const dLam = (lon  - 5.38720621 ) / 0.00001;
+// Converteer Overpass JSON naar GeoJSON FeatureCollection
+function overpassToGeoJSON(data) {
+  const fc = { type: 'FeatureCollection', features: [] };
+  const nodes = new Map();
+  if (Array.isArray(data.elements)) {
+    for (const el of data.elements) {
+      if (el.type === 'node') nodes.set(el.id, [el.lon, el.lat]);
+    }
+    for (const el of data.elements) {
+      if (el.type === 'way' && Array.isArray(el.geometry)) {
+        const coords = el.geometry.map(p => [p.lon, p.lat]);
+        // sluit polygon indien open
+        if (coords.length >= 3 && (coords[0][0] !== coords[coords.length-1][0] || coords[0][1] !== coords[coords.length-1][1])) {
+          coords.push(coords[0]);
+        }
+        if (coords.length >= 4) {
+          fc.features.push({
+            type: 'Feature',
+            id: `way.${el.id}`,
+            properties: { id: el.id, type: 'way', tags: el.tags || {} },
+            geometry: { type: 'Polygon', coordinates: [coords] }
+          });
+        }
+      } else if (el.type === 'relation' && el.tags && el.tags.type === 'multipolygon' && Array.isArray(el.members)) {
+        // eenvoudige multipolygon reconstructie (alle outer-ways samenvoegen)
+        const outers = el.members.filter(m => m.role === 'outer' && m.type === 'way' && Array.isArray(m.geometry));
+        if (outers.length) {
+          const polys = [];
+          for (const m of outers) {
+            const coords = m.geometry.map(p => [p.lon, p.lat]);
+            if (coords.length >= 3 && (coords[0][0] !== coords[coords.length-1][0] || coords[0][1] !== coords[coords.length-1][1])) {
+              coords.push(coords[0]);
+            }
+            if (coords.length >= 4) polys.push(coords);
+          }
+          if (polys.length) {
+            fc.features.push({
+              type: 'Feature',
+              id: `rel.${el.id}`,
+              properties: { id: el.id, type: 'relation', tags: el.tags || {} },
+              geometry: polys.length === 1
+                ? { type: 'Polygon', coordinates: [polys[0]] }
+                : { type: 'MultiPolygon', coordinates: polys.map(r => [r]) }
+            });
+          }
+        }
+      }
+    }
+  }
+  return fc;
+}
 
-  const Kp = [
-    [ 3235.65389,  0, 1],[-32.58297,2,0],[-0.24750,0,2],[-0.84978,2,1],[-0.06550,0,3],
-    [-0.01709,2,2],[-0.00738,1,0],[0.00530,4,0],[-0.00039,2,3],[0.00033,4,1],[-0.00012,0,1]
-  ];
-  const Lp = [
-    [ 5260.52916,1,0],[105.94684,1,1],[2.45656,1,2],[-0.81885,3,0],[0.05594,1,3],
-    [-0.05607,3,1],[0.01199,0,1],[-0.00256,2,0],[0.00128,1,4],[0.00022,0,2],
-    [-0.00022,2,2],[0.00026,4,0]
-  ];
-
-  let dY = 0, dX = 0;
-  for (const [c,p,q] of Kp) dX += c * Math.pow(dPhi, p) * Math.pow(dLam, q);
-  for (const [c,p,q] of Lp) dY += c * Math.pow(dPhi, p) * Math.pow(dLam, q);
-
-  const x = 155000 + dY; // RD-X
-  const y = 463000 + dX; // RD-Y
-  return [x, y];
+// 'height' kan strings bevatten zoals "12", "12.5", "12 m" of "40ft"
+function parseHeight(v) {
+  if (!v || typeof v !== 'string') return null;
+  const s = v.trim().toLowerCase();
+  // meters met of zonder "m"
+  let m = s.match(/^([\d.,]+)\s*m?$/);
+  if (m) return toNum(m[1]);
+  // feet -> meters
+  m = s.match(/^([\d.,]+)\s*ft?$/);
+  if (m) {
+    const ft = toNum(m[1]);
+    return ft != null ? ft * 0.3048 : null;
+  }
+  return null;
+}
+function toNum(x) {
+  if (x == null) return null;
+  const n = Number(String(x).replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
 }
