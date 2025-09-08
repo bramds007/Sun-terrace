@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SunTerras — Per-terras zon (tuned)</title>
+  <title>SunTerras — Per-terras zon (shadow corridor)</title>
   <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
   <style>
@@ -46,16 +46,16 @@ function sunPosition(date, lat, lon){
   const alt=Math.asin(Math.sin(phi)*Math.sin(c.dec)+Math.cos(phi)*Math.cos(c.dec)*Math.cos(H));
   const azSouth=Math.atan2(Math.sin(H), Math.cos(H)*Math.sin(phi)-Math.tan(c.dec)*Math.cos(phi)); // 0°=Zuid
   const azimuthSouth=(toDeg(azSouth)+360)%360;
-  const azimuthNorth=(azimuthSouth+180)%360; // FIX: 0°=Noord (turf.bearing)
+  const azimuthNorth=(azimuthSouth+180)%360; // 0°=Noord (turf.bearing)
   return { altitude: toDeg(alt), azSouth: azimuthSouth, azNorth: azimuthNorth };
 }
 
-/* ===== Tunables (milder) ===== */
+/* ===== Tunables (fijner) ===== */
 const AMS = { lon: 4.895168, lat: 52.370216 };
-const ALT_MIN = 3.0;          // was 2.5
-const AZ_WINDOW = 20;          // was 25
-const EXTRA_MARGIN_M = 3;      // was 6
-const MAX_BUILDING_DIST_M = 150; // was 250
+const ALT_MIN = 3.0;             // onder deze hoogte: praktisch schaduw
+const AZ_WINDOW = 15;            // ± graden voor "upsun" test
+const MAX_BUILDING_DIST_M = 120; // alleen echt nabije blockers
+const CORRIDOR_WIDTH_M = 4;      // half-breedte van de schaduw-corridor
 
 const COLORS = { sunFill:'#22c55e', shadeFill:'#cbd5e1' };
 
@@ -103,7 +103,7 @@ async function init(){
     map.on('click','terr-fill',(e)=>{
       const f=e.features[0]; const p=f.properties||{};
       const st=map.getFeatureState({ source:'terr-polys', id:f.id })||{};
-      const expl = st.explain ? `<br><small>${st.explain}</small>` : '';
+      const expl=st.explain?`<br><small>${st.explain}</small>`:'';
       new maplibregl.Popup().setLngLat(e.lngLat)
         .setHTML(`<strong>${p.name||'Terras'}</strong><br>${st.sunny?'🌞 in de zon':'⛅︎ schaduw'}${expl}`)
         .addTo(map);
@@ -181,7 +181,7 @@ function setupSunControls(){
   });
 }
 
-/* ===== Per-terras zon + "alleen zon" ===== */
+/* ===== Per-terras zon + "alleen zon" (shadow corridor) ===== */
 function computePerTerraceSunAndApply(){
   const t=document.getElementById('time');
   const d=document.getElementById('date');
@@ -207,10 +207,11 @@ function computePerTerraceSunAndApply(){
     return;
   }
 
-  const sunnyFn=makeSunnyFn(alt, azNorth, BUILDINGS);
+  const sunnyFn=makeSunnyFnCorridor(alt, azNorth, BUILDINGS);
   const bounds=map.getBounds();
   const inView=(f)=>{ const c=turf.center(f).geometry.coordinates;
-    return c[0]>=bounds.getWest() && c[0]<=bounds.getEast() && c[1]>=bounds.getSouth() && c[1]<=bounds.getNorth(); };
+    return c[0]>=bounds.getWest() && c[0]<=bounds.getEast() &&
+           c[1]>=bounds.getSouth() && c[1]<=bounds.getNorth(); };
 
   let sunnyCount=0;
   for(const f of (TERR_POLY.features||[])){
@@ -241,33 +242,56 @@ function setTerrSourceData(gj){ TERR_POLY_CURRENT=gj; const src=map.getSource('t
 function resetStates(sourceId, gj){ for(const f of (gj.features||[])){ map.setFeatureState({ source:sourceId, id:f.id }, { sunny:false, explain:'' }); } }
 function emptyFC(){ return { type:'FeatureCollection', features:[] }; }
 
-// Heuristiek met Noord-referentie
-function makeSunnyFn(altDeg, azNorthDeg, buildings){
+/* ===== Nieuwe heuristiek: "schaduw-corridor" =====
+   - Voor elk gebouw: bepaal L = h / tan(alt)
+   - Schaduwrichting = azNorth + 180°
+   - Corridor = buffer om lijn (gebouw → gebouw+L) met breedte ± CORRIDOR_WIDTH_M
+   - Terras schaduw als centroid in corridor EN gebouw is "upsun" (bearing terras→gebouw binnen ±AZ_WINDOW)
+*/
+function makeSunnyFnCorridor(altDeg, azNorthDeg, buildings){
   const altRad=Math.max(altDeg*Math.PI/180, 0.01);
   const tanAlt=Math.tan(altRad);
+  const shadowDir=(azNorthDeg+180)%360;    // richting waarin schaduw valt
   const azMin=azNorthDeg-AZ_WINDOW, azMax=azNorthDeg+AZ_WINDOW;
 
   return function(terr){
-    const cTerr=turf.center(terr).geometry.coordinates;
-    let blocker=null;
+    const terrCenter = turf.center(terr).geometry.coordinates;
+    const terrPt = turf.point(terrCenter);
+    let blockedBy = null;
 
     for(const b of (buildings.features||[])){
       const h=b.properties?.h_m;
       if(!(typeof h==='number' && h>=3)) continue;
 
-      const cB=turf.center(b).geometry.coordinates;
-      const brgNorth=(turf.bearing(turf.point(cTerr), turf.point(cB))+360)%360;
+      // snelle afstanden-check (centroid→centroid)
+      const bCenter = turf.center(b).geometry.coordinates;
+      const dMeters = turf.distance(terrCenter, bCenter) * 1000;
+      if(dMeters > MAX_BUILDING_DIST_M) continue;
+
+      // gebouw moet upsun liggen (terras -> gebouw ≈ zon-azimuth)
+      const brgNorth = (turf.bearing(terrPt, turf.point(bCenter)) + 360) % 360;
       if(!angleWithin(brgNorth, azMin, azMax)) continue;
 
-      const d=turf.distance(cTerr, cB)*1000; // m
-      if(d>MAX_BUILDING_DIST_M) continue;
+      // schaduw-lengte
+      const L = h / tanAlt;
+      if (L <= 0) continue;
 
-      const L=h/tanAlt;
-      if(d<=L+EXTRA_MARGIN_M){ if(!blocker || d<blocker.d) blocker={ d, h, L }; }
+      // corridor: lijn vanaf gebouw in schaduwrichting, lengte L
+      const p0 = turf.point(bCenter);
+      const p1 = turf.destination(p0, L/1000, shadowDir, {units:'kilometers'});
+      const line = turf.lineString([p0.geometry.coordinates, p1.geometry.coordinates]);
+      const corridor = turf.buffer(line, CORRIDOR_WIDTH_M/1000, { units:'kilometers', steps: 8 });
+
+      if (turf.booleanPointInPolygon(terrPt, corridor)) {
+        // dichterbij blokker wint
+        if (!blockedBy || dMeters < blockedBy.d) blockedBy = { d: dMeters, h, L };
+      }
     }
 
-    if(blocker){ return { sunny:false, explain:`blok: d≈${Math.round(blocker.d)}m, h≈${Math.round(blocker.h)}m, L≈${Math.round(blocker.L)}m` }; }
-    return { sunny:true, explain:`vrij (±${AZ_WINDOW}°; ≤${MAX_BUILDING_DIST_M}m)` };
+    if(blockedBy){
+      return { sunny:false, explain:`blok: d≈${Math.round(blockedBy.d)}m, h≈${Math.round(blockedBy.h)}m, L≈${Math.round(blockedBy.L)}m` };
+    }
+    return { sunny:true, explain:`vrij (corridor ±${CORRIDOR_WIDTH_M}m, upsun ±${AZ_WINDOW}°)` };
   };
 }
 
