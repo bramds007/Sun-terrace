@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SunTerras — Globale zon + gebouwen debug</title>
+  <title>SunTerras — Per-terras zon</title>
   <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
   <style>
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
     header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    #map{position:absolute;inset:64px 0 0 0}
+    #map{position:absolute;inset:96px 0 0 0}
     .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
     .btn{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}
   </style>
@@ -22,6 +23,7 @@
   <label>Tijd: <input id="time" type="time" step="300" /></label>
   <label>Datum: <input id="date" type="date" /></label>
   <button class="btn" id="btnNow">Nu</button>
+  <label><input id="onlySunny" type="checkbox" /> alleen zon</label>
   <span class="badge" id="sunBadge">Zon: …</span>
 </header>
 
@@ -34,8 +36,12 @@ function toRad(d){return d*Math.PI/180}
 function toDeg(r){return r*180/Math.PI}
 function getJulian(date){return date/86400000 - date.getTimezoneOffset()/1440 + 2440587.5}
 function solarMeanAnomaly(d){return toRad(357.5291 + 0.98560028*(d-2451545))}
-function eclipticLongitude(M){const C=toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);const P=toRad(102.9372);return M+C+P+Math.PI;}
-function sunCoords(d){const M=solarMeanAnomaly(d),L=eclipticLongitude(M),e=toRad(23.4397);return{dec:Math.asin(Math.sin(e)*Math.sin(L)),ra:Math.atan2(Math.cos(e)*Math.sin(L),Math.cos(L))};}
+function eclipticLongitude(M){
+  const C=toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);
+  const P=toRad(102.9372); return M+C+P+Math.PI;
+}
+function sunCoords(d){const M=solarMeanAnomaly(d),L=eclipticLongitude(M),e=toRad(23.4397);
+  return {dec:Math.asin(Math.sin(e)*Math.sin(L)), ra:Math.atan2(Math.cos(e)*Math.sin(L),Math.cos(L))};}
 function siderealTime(d,lw){return toRad((280.16+360.9856235*(d-2451545)))-lw;}
 function sunPosition(date, lat, lon){
   const lw=toRad(-lon), phi=toRad(lat), d=getJulian(date)-2451545, c=sunCoords(d);
@@ -45,13 +51,18 @@ function sunPosition(date, lat, lon){
   return { altitude: toDeg(alt), azimuth: (toDeg(az)+180+360)%360 };
 }
 
-/* ===== App state ===== */
+/* ===== App state / constants ===== */
 const AMS = { lon: 4.895168, lat: 52.370216 };
-const ALT_THRESHOLD = 2.5;
+const ALT_MIN = 2.5;           // onder deze zonhoogte: praktisch schaduw
+const AZ_WINDOW = 25;          // ± graden rondom zonrichting
+const EXTRA_MARGIN_M = 6;      // marge op schaduwlengte
+const MAX_BUILDING_DIST_M = 250; // alleen nabije gebouwen bekijken
+
 const COLORS = { sunFill:'#22c55e', shadeFill:'#cbd5e1' };
 
-let TERR_POLY = null;
-let BUILDINGS = { type:'FeatureCollection', features:[] };
+let TERR_POLY = null;                    // originele set (polygons)
+let TERR_POLY_CURRENT = null;            // huidige set in de bron (voor "alleen zon")
+let BUILDINGS = { type:'FeatureCollection', features:[] }; // gebouwen (OSM)
 </script>
 
 <script>
@@ -73,31 +84,37 @@ async function init(){
   const badge=document.getElementById('dataBadge');
 
   try {
+    // Terrassen (alleen polygons)
     const r = await fetch('/api/terraces');
     if (!r.ok) throw new Error('HTTP '+r.status);
     const data = await r.json();
-
     TERR_POLY = data.terracePolys || { type:'FeatureCollection', features:[] };
+    TERR_POLY_CURRENT = TERR_POLY;
 
-    map.addSource('terr-polys', { type:'geojson', data: TERR_POLY });
+    // Bronnen met promoteId zodat feature-state per id kan
+    map.addSource('terr-polys', { type:'geojson', data: TERR_POLY_CURRENT, promoteId:'id' });
+    // Lagen
     map.addLayer({ id:'terr-fill', type:'fill', source:'terr-polys',
       paint:{ 'fill-color': COLORS.shadeFill, 'fill-opacity':0.55 }});
     map.addLayer({ id:'terr-outline', type:'line', source:'terr-polys',
       paint:{ 'line-color':'#111','line-width':1 }});
     map.addLayer({ id:'terr-label', type:'symbol', source:'terr-polys',
       layout:{ 'text-field':['get','name'], 'text-size':11, 'text-offset':[0,1.0], 'text-anchor':'top' },
-      paint:{ 'text-halo-color':'#fff', 'text-halo-width':1.2 }});
+      paint:{ 'text-halo-color':'#fff','text-halo-width':1.2 }});
 
-    // Gebouwen bron + lagen (outline)
+    // Gebouwen bron + outline (debug)
     map.addSource('bldg', { type:'geojson', data: BUILDINGS });
     map.addLayer({ id:'bldg-outline', type:'line', source:'bldg',
-      paint:{ 'line-color':'#9ca3af','line-width':0.8,'line-opacity':0.8 }});
+      paint:{ 'line-color':'#9ca3af','line-width':0.8,'line-opacity':0.7 }});
 
-    // popup
+    // Popup met uitleg uit feature-state
     map.on('click','terr-fill', (e) => {
-      const p = e.features[0].properties || {};
+      const f = e.features[0];
+      const p = f.properties || {};
+      const st = map.getFeatureState({ source:'terr-polys', id: f.id }) || {};
+      const expl = st.explain ? `<br><small>${st.explain}</small>` : '';
       new maplibregl.Popup().setLngLat(e.lngLat)
-        .setHTML(`<strong>${p.name || 'Terras'}</strong>`)
+        .setHTML(`<strong>${p.name || 'Terras'}</strong><br>${st.sunny?'🌞 in de zon':'⛅︎ schaduw'}${expl}`)
         .addTo(map);
     });
 
@@ -107,11 +124,19 @@ async function init(){
 
     // Zon UI
     setupSunControls();
-    updateSunStyle();
-
-    // eerste gebouwenload + elke moveend (debounced)
+    // 1e gebouwen + berekening
     await loadBuildingsForViewport();
-    let t; map.on('moveend', ()=>{ clearTimeout(t); t=setTimeout(loadBuildingsForViewport, 150); });
+    computePerTerraceSunAndApply();
+
+    // Bij pannen/zoomen: gebouwen vernieuwen + herbereken
+    let t;
+    map.on('moveend', ()=>{
+      clearTimeout(t);
+      t = setTimeout(async ()=>{
+        await loadBuildingsForViewport();
+        computePerTerraceSunAndApply();
+      }, 150);
+    });
 
   } catch (e) {
     info.textContent = 'Laden mislukt';
@@ -129,7 +154,7 @@ function fitTo(polys){
   if (isFinite(ex[0])) map.fitBounds([[ex[0],ex[1]],[ex[2],ex[3]]], { padding:60, duration:600 });
 }
 
-/* ===== Gebouwen laden + badge updaten ===== */
+/* ===== Gebouwen laden + badge ===== */
 function currentBbox(){
   const b = map.getBounds();
   return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(',');
@@ -139,47 +164,162 @@ async function loadBuildingsForViewport(){
   const r = await fetch(`/api/buildings?bbox=${bbox}`);
   const j = await r.json().catch(()=>null);
   BUILDINGS = j?.buildings || { type:'FeatureCollection', features:[] };
-  // update bron
+
+  // filter safety (API doet dit al, maar nog eens lokaal)
+  BUILDINGS.features = (BUILDINGS.features||[]).filter(f => {
+    const h = f.properties?.h_m;
+    return typeof h === 'number' && h >= 3;
+  });
+
   if (map.getSource('bldg')) map.getSource('bldg').setData(BUILDINGS);
   const badge=document.getElementById('dataBadge');
   if (badge) badge.textContent = `Terrassen: ${TERR_POLY.features.length} • Gebouwen: ${BUILDINGS.features.length} (OSM)`;
 }
 
-/* ===== Zon UI & globale kleuring (ongewijzigd) ===== */
+/* ===== Zon UI ===== */
 function setupSunControls(){
   const t=document.getElementById('time');
   const d=document.getElementById('date');
   const btnNow=document.getElementById('btnNow');
+  const only=document.getElementById('onlySunny');
 
   const now = new Date();
   const pad = n => String(n).padStart(2,'0');
   if (t) t.value = `${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`;
   if (d) d.valueAsDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-  t.addEventListener('input', updateSunStyle);
-  d.addEventListener('input', updateSunStyle);
+  const onChange = ()=> computePerTerraceSunAndApply();
+  t.addEventListener('input', onChange);
+  d.addEventListener('input', onChange);
+  only.addEventListener('change', onChange);
   btnNow.addEventListener('click', ()=>{
     const n=new Date();
     t.value = `${pad(n.getHours())}:${pad(n.getMinutes()-n.getMinutes()%5)}`;
     d.valueAsDate = new Date(n.getFullYear(), n.getMonth(), n.getDate());
-    updateSunStyle();
+    computePerTerraceSunAndApply();
   });
 }
 
-function updateSunStyle(){
+/* ===== Per-terras zon + "alleen zon" ===== */
+function computePerTerraceSunAndApply(){
   const t=document.getElementById('time');
   const d=document.getElementById('date');
   const b=document.getElementById('sunBadge');
+  const only=document.getElementById('onlySunny');
 
   const base = d.valueAsDate || new Date();
   const [hh,mm] = (t.value||'12:00').split(':').map(x=>parseInt(x,10));
   const when = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hh||12, mm||0);
 
   const sp = sunPosition(when, AMS.lat, AMS.lon);
-  const isSunny = sp.altitude > ALT_THRESHOLD;
-  b.textContent = `Zon: alt ${sp.altitude.toFixed(1)}° • az ${Math.round(sp.azimuth)}° ${isSunny?'🌞':''}`;
+  const alt = sp.altitude, az = sp.azimuth;
+  b.textContent = `Zon: alt ${alt.toFixed(1)}° • az ${Math.round(az)}° ${alt>ALT_MIN?'🌞':''}`;
 
-  map.setPaintProperty('terr-fill','fill-color', isSunny ? COLORS.sunFill : COLORS.shadeFill);
+  // Fallback naar globale modus als we (nog) geen gebouwen hebben
+  if (!BUILDINGS.features || BUILDINGS.features.length === 0) {
+    const isSunny = alt > ALT_MIN;
+    map.setPaintProperty('terr-fill','fill-color', isSunny ? COLORS.sunFill : COLORS.shadeFill);
+    // alleen zon → alles verbergen als niet zonnig
+    if (only.checked) {
+      setTerrSourceData(isSunny ? TERR_POLY : emptyFC());
+    } else {
+      setTerrSourceData(TERR_POLY);
+    }
+    // feature-state reset
+    resetStates('terr-polys', TERR_POLY);
+    return;
+  }
+
+  // Met gebouwen: per-terras feature-state + optioneel filter
+  const sunnyFn = makeSunnyFn(alt, az, BUILDINGS);
+  const bounds = map.getBounds();
+  const inView = (f)=>{
+    const c = turf.center(f).geometry.coordinates;
+    return c[0] >= bounds.getWest() && c[0] <= bounds.getEast() &&
+           c[1] >= bounds.getSouth() && c[1] <= bounds.getNorth();
+  };
+
+  // 1) state per feature
+  for (const f of (TERR_POLY.features||[])) {
+    let state = { sunny:false, explain:`alt ${alt.toFixed(1)}° ≤ ${ALT_MIN}°` };
+    if (alt > ALT_MIN && inView(f)) state = sunnyFn(f);
+    map.setFeatureState({ source:'terr-polys', id: f.id }, state);
+  }
+
+  // 2) kleuren via feature-state
+  map.setPaintProperty('terr-fill','fill-color',
+    ['case',['boolean',['feature-state','sunny'],false], COLORS.sunFill, COLORS.shadeFill]
+  );
+
+  // 3) “alleen zon” → subset in de bron
+  if (only.checked) {
+    const subset = { type:'FeatureCollection', features:[] };
+    for (const f of (TERR_POLY.features||[])) {
+      const st = map.getFeatureState({ source:'terr-polys', id: f.id });
+      if (st && st.sunny) subset.features.push(f);
+    }
+    setTerrSourceData(subset);
+  } else {
+    setTerrSourceData(TERR_POLY);
+  }
+}
+
+function setTerrSourceData(gj){
+  TERR_POLY_CURRENT = gj;
+  const src = map.getSource('terr-polys');
+  if (src) src.setData(gj);
+}
+
+function resetStates(sourceId, gj){
+  for (const f of (gj.features||[])) {
+    map.setFeatureState({ source:sourceId, id:f.id }, { sunny:false, explain:'' });
+  }
+}
+
+function emptyFC(){ return { type:'FeatureCollection', features:[] }; }
+
+// Schaduw-heuristiek:
+//  - Alleen gebouwen binnen ±AZ_WINDOW° van zonrichting,
+//  - Alleen gebouwen met h_m ≥ 3 m en binnen MAX_BUILDING_DIST_M,
+//  - Schaduw als afstand (centroid→centroid) ≤ (h / tan(alt)) + EXTRA_MARGIN_M.
+function makeSunnyFn(altDeg, azDeg, buildings){
+  const altRad = Math.max(altDeg * Math.PI/180, 0.01); // guard
+  const tanAlt = Math.tan(altRad);
+  const azMin = azDeg - AZ_WINDOW, azMax = azDeg + AZ_WINDOW;
+
+  return function(terr){
+    const cTerr = turf.center(terr).geometry.coordinates;
+    let blocker = null;
+
+    for (const b of (buildings.features || [])) {
+      const h = b.properties?.h_m;
+      if (!(typeof h === 'number' && h >= 3)) continue;
+
+      const cB = turf.center(b).geometry.coordinates;
+      const brg = turf.bearing(turf.point(cTerr), turf.point(cB));
+      const brg360 = (brg + 360) % 360;
+      if (!angleWithin(brg360, azMin, azMax)) continue;
+
+      const d = turf.distance(cTerr, cB) * 1000; // meters
+      if (d > MAX_BUILDING_DIST_M) continue;
+
+      const L = h / tanAlt;
+      if (d <= L + EXTRA_MARGIN_M) {
+        if (!blocker || d < blocker.d) blocker = { d, h, L };
+      }
+    }
+
+    if (blocker) {
+      return { sunny:false, explain:`blok: d≈${Math.round(blocker.d)}m, h≈${Math.round(blocker.h)}m, L≈${Math.round(blocker.L)}m` };
+    }
+    return { sunny:true, explain:`vrij (±${AZ_WINDOW}°; ≤${MAX_BUILDING_DIST_M}m)` };
+  };
+}
+
+function angleWithin(a, min, max){
+  const norm = x => (x % 360 + 360) % 360;
+  const A = norm(a), MIN = norm(min), MAX = norm(max);
+  return (MIN <= MAX) ? (A >= MIN && A <= MAX) : (A >= MIN || A <= MAX);
 }
 </script>
 </body>
