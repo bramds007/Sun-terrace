@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SunTerras — Globale zon</title>
+  <title>SunTerras — Globale zon + gebouwen debug</title>
   <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
   <style>
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
@@ -17,7 +17,7 @@
 <header>
   <strong>SunTerras</strong>
   <span class="badge" id="info">Laden…</span>
-  <span class="badge" id="dataBadge">Terrassen: ?</span>
+  <span class="badge" id="dataBadge">Terrassen: ? • Gebouwen: ?</span>
 
   <label>Tijd: <input id="time" type="time" step="300" /></label>
   <label>Datum: <input id="date" type="date" /></label>
@@ -34,12 +34,8 @@ function toRad(d){return d*Math.PI/180}
 function toDeg(r){return r*180/Math.PI}
 function getJulian(date){return date/86400000 - date.getTimezoneOffset()/1440 + 2440587.5}
 function solarMeanAnomaly(d){return toRad(357.5291 + 0.98560028*(d-2451545))}
-function eclipticLongitude(M){
-  const C=toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);
-  const P=toRad(102.9372); return M+C+P+Math.PI;
-}
-function sunCoords(d){const M=solarMeanAnomaly(d),L=eclipticLongitude(M),e=toRad(23.4397);
-  return {dec:Math.asin(Math.sin(e)*Math.sin(L)), ra:Math.atan2(Math.cos(e)*Math.sin(L),Math.cos(L))};}
+function eclipticLongitude(M){const C=toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);const P=toRad(102.9372);return M+C+P+Math.PI;}
+function sunCoords(d){const M=solarMeanAnomaly(d),L=eclipticLongitude(M),e=toRad(23.4397);return{dec:Math.asin(Math.sin(e)*Math.sin(L)),ra:Math.atan2(Math.cos(e)*Math.sin(L),Math.cos(L))};}
 function siderealTime(d,lw){return toRad((280.16+360.9856235*(d-2451545)))-lw;}
 function sunPosition(date, lat, lon){
   const lw=toRad(-lon), phi=toRad(lat), d=getJulian(date)-2451545, c=sunCoords(d);
@@ -51,10 +47,11 @@ function sunPosition(date, lat, lon){
 
 /* ===== App state ===== */
 const AMS = { lon: 4.895168, lat: 52.370216 };
-const ALT_THRESHOLD = 2.5; // zon “aan” boven ~2.5°
+const ALT_THRESHOLD = 2.5;
 const COLORS = { sunFill:'#22c55e', shadeFill:'#cbd5e1' };
 
 let TERR_POLY = null;
+let BUILDINGS = { type:'FeatureCollection', features:[] };
 </script>
 
 <script>
@@ -62,8 +59,8 @@ let TERR_POLY = null;
 const map = new maplibregl.Map({
   container: 'map',
   style: { version: 8,
-    sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, attribution: '© OpenStreetMap' } },
-    layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+    sources: { osm: { type:'raster', tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize:256, attribution:'© OpenStreetMap' } },
+    layers: [{ id:'osm', type:'raster', source:'osm' }]
   },
   center: [AMS.lon, AMS.lat], zoom: 13
 });
@@ -91,6 +88,11 @@ async function init(){
       layout:{ 'text-field':['get','name'], 'text-size':11, 'text-offset':[0,1.0], 'text-anchor':'top' },
       paint:{ 'text-halo-color':'#fff', 'text-halo-width':1.2 }});
 
+    // Gebouwen bron + lagen (outline)
+    map.addSource('bldg', { type:'geojson', data: BUILDINGS });
+    map.addLayer({ id:'bldg-outline', type:'line', source:'bldg',
+      paint:{ 'line-color':'#9ca3af','line-width':0.8,'line-opacity':0.8 }});
+
     // popup
     map.on('click','terr-fill', (e) => {
       const p = e.features[0].properties || {};
@@ -101,11 +103,16 @@ async function init(){
 
     fitTo(TERR_POLY);
     info.textContent = 'OK';
-    badge.textContent = `Terrassen (polygons): ${TERR_POLY.features.length}`;
+    badge.textContent = `Terrassen: ${TERR_POLY.features.length} • Gebouwen: …`;
 
     // Zon UI
     setupSunControls();
     updateSunStyle();
+
+    // eerste gebouwenload + elke moveend (debounced)
+    await loadBuildingsForViewport();
+    let t; map.on('moveend', ()=>{ clearTimeout(t); t=setTimeout(loadBuildingsForViewport, 150); });
+
   } catch (e) {
     info.textContent = 'Laden mislukt';
     console.error(e);
@@ -122,7 +129,23 @@ function fitTo(polys){
   if (isFinite(ex[0])) map.fitBounds([[ex[0],ex[1]],[ex[2],ex[3]]], { padding:60, duration:600 });
 }
 
-/* ===== Zon UI & globale kleuring ===== */
+/* ===== Gebouwen laden + badge updaten ===== */
+function currentBbox(){
+  const b = map.getBounds();
+  return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(',');
+}
+async function loadBuildingsForViewport(){
+  const bbox = currentBbox();
+  const r = await fetch(`/api/buildings?bbox=${bbox}`);
+  const j = await r.json().catch(()=>null);
+  BUILDINGS = j?.buildings || { type:'FeatureCollection', features:[] };
+  // update bron
+  if (map.getSource('bldg')) map.getSource('bldg').setData(BUILDINGS);
+  const badge=document.getElementById('dataBadge');
+  if (badge) badge.textContent = `Terrassen: ${TERR_POLY.features.length} • Gebouwen: ${BUILDINGS.features.length} (OSM)`;
+}
+
+/* ===== Zon UI & globale kleuring (ongewijzigd) ===== */
 function setupSunControls(){
   const t=document.getElementById('time');
   const d=document.getElementById('date');
@@ -154,7 +177,6 @@ function updateSunStyle(){
 
   const sp = sunPosition(when, AMS.lat, AMS.lon);
   const isSunny = sp.altitude > ALT_THRESHOLD;
-
   b.textContent = `Zon: alt ${sp.altitude.toFixed(1)}° • az ${Math.round(sp.azimuth)}° ${isSunny?'🌞':''}`;
 
   map.setPaintProperty('terr-fill','fill-color', isSunny ? COLORS.sunFill : COLORS.shadeFill);
