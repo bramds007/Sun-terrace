@@ -3,70 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SunTerras — Amsterdam</title>
+  <title>SunTerras — Alleen terrassen (polygons)</title>
   <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
   <style>
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif}
     header{padding:10px 12px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    #map{position:absolute;inset:96px 0 0 0}
+    #map{position:absolute;inset:56px 0 0 0}
     .badge{padding:4px 8px;border-radius:999px;background:#f5f5f5}
-    .btn{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}
-    .debug{position:absolute;top:64px;right:10px;background:#fff;border:1px solid #eee;border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.25;box-shadow:0 2px 10px rgba(0,0,0,.05);max-width:320px}
-    .debug b{display:inline-block;min-width:90px}
-    .sep{height:1px;background:#eee;margin:6px 0}
   </style>
 </head>
 <body>
 <header>
-  <strong>SunTerras — AMS</strong>
+  <strong>SunTerras</strong>
   <span class="badge" id="info">Laden…</span>
   <span class="badge" id="dataBadge">Data: ?</span>
-
-  <label>Tijd: <input id="time" type="time" step="300" /></label>
-  <label>Datum: <input id="date" type="date" /></label>
-  <button class="btn" id="btnNow">Nu</button>
-  <label><input id="onlySunny" type="checkbox" /> alleen zon</label>
-  <span class="badge" id="sunBadge">Zon: …</span>
 </header>
-
 <div id="map"></div>
-<div class="debug" id="debugBox" hidden>
-  <div><b>Zon alt:</b><span id="dbgAlt">-</span>° &nbsp; <b>az:</b><span id="dbgAz">-</span>°</div>
-  <div><b>Gebr. bron:</b><span id="dbgSrc">-</span></div>
-  <div><b>Gebouwen:</b><span id="dbgBdg">0</span> (h≥3 m)</div>
-  <div id="dbgStats" style="color:#6b7280"></div>
-  <div class="sep"></div>
-  <div><b>Terras poly:</b><span id="dbgPoly">0</span> — <b>punten:</b><span id="dbgPts">0</span></div>
-  <div><b>Filter:</b><span id="dbgFilter">alle</span></div>
-</div>
 
 <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
 <script>
-/* ===== Zonberekening ===== */
-function toRad(d){return d*Math.PI/180}
-function toDeg(r){return r*180/Math.PI}
-function getJulian(date){return date/86400000 - date.getTimezoneOffset()/1440 + 2440587.5}
-function solarMeanAnomaly(d){return toRad(357.5291 + 0.98560028*(d-2451545))}
-function eclipticLongitude(M){const C=toRad(1.9148)*Math.sin(M)+toRad(0.02)*Math.sin(2*M)+toRad(0.0003)*Math.sin(3*M);const P=toRad(102.9372);return M+C+P+Math.PI;}
-function sunCoords(d){const M=solarMeanAnomaly(d),L=eclipticLongitude(M),e=toRad(23.4397);return{dec:Math.asin(Math.sin(e)*Math.sin(L)),ra:Math.atan2(Math.cos(e)*Math.sin(L),Math.cos(L))};}
-function siderealTime(d,lw){return toRad((280.16+360.9856235*(d-2451545)))-lw;}
-function sunPosition(date, lat, lon){const lw=toRad(-lon),phi=toRad(lat),d=getJulian(date)-2451545,c=sunCoords(d);const H=siderealTime(getJulian(date),lw)-c.ra;const alt=Math.asin(Math.sin(phi)*Math.sin(c.dec)+Math.cos(phi)*Math.cos(c.dec)*Math.cos(H));const az=Math.atan2(Math.sin(H),Math.cos(H)*Math.sin(phi)-Math.tan(c.dec)*Math.cos(phi));return{altitude:toDeg(alt),azimuth:(toDeg(az)+180+360)%360};}
-
-/* ===== App state & constants ===== */
 const AMS = { lon: 4.895168, lat: 52.370216 };
-const ALT_MIN = 2.5;          // onder deze hoogte: praktisch schaduw
-const AZ_WINDOW = 25;         // ± graden rondom zon-azimuth voor "achter gebouw?"
-const EXTRA_MARGIN_M = 6;     // marge op schaduwlengte
-const MAX_BUILDING_DIST_M = 250; // prestatie: alleen gebouwen binnen 250 m checken
 
-const COLORS = { sunFill:'#22c55e', shadeFill:'#cbd5e1', sunPt:'#22c55e', shadePt:'#cbd5e1' };
-
-let TERR_POLY=null, TERR_PTS=null;     // horeca
-let BUILDINGS={type:'FeatureCollection',features:[]}; // gebouwen (OSM)
-let BUILDING_SRC='-'; let BUILDING_STATS=null;
-
-/* ===== Kaart ===== */
 const map = new maplibregl.Map({
   container: 'map',
   style: { version: 8,
@@ -82,249 +39,50 @@ map.on('load', init);
 async function init(){
   const info=document.getElementById('info');
   const badge=document.getElementById('dataBadge');
-  document.getElementById('debugBox').hidden = false;
 
   try {
-    // Horeca (alles)
     const r = await fetch('/api/terraces');
     if (!r.ok) throw new Error('HTTP '+r.status);
     const data = await r.json();
-    TERR_POLY  = data.terracePolys || { type:'FeatureCollection', features:[] };
-    TERR_PTS   = data.placePoints  || { type:'FeatureCollection', features:[] };
 
-    map.addSource('terr-polys',  { type:'geojson', data: TERR_POLY, promoteId:'id' });
-    map.addSource('terr-points', { type:'geojson', data: TERR_PTS,  promoteId:'id' });
+    const POLYS = data.terracePolys || { type:'FeatureCollection', features:[] };
+
+    map.addSource('terr-polys', { type:'geojson', data: POLYS });
 
     map.addLayer({ id:'terr-fill', type:'fill', source:'terr-polys',
-      paint:{ 'fill-color': COLORS.shadeFill, 'fill-opacity':0.55 }});
+      paint:{ 'fill-color':'#22c55e','fill-opacity':0.55 }});
     map.addLayer({ id:'terr-outline', type:'line', source:'terr-polys',
-      paint:{ 'line-color':'#111', 'line-width':1 }});
-    map.addLayer({ id:'terr-points', type:'circle', source:'terr-points',
-      paint:{ 'circle-color': COLORS.shadePt, 'circle-radius':6, 'circle-stroke-width':1, 'circle-stroke-color':'#111' }});
-    map.addLayer({ id:'terr-label-polys', type:'symbol', source:'terr-polys',
-      layout:{ 'text-field':['get','name'], 'text-size':11, 'text-offset':[0,1.0], 'text-anchor':'top' },
-      paint:{ 'text-halo-color':'#fff', 'text-halo-width':1.2 }});
-    map.addLayer({ id:'terr-label-pts', type:'symbol', source:'terr-points',
+      paint:{ 'line-color':'#111','line-width':1 }});
+    map.addLayer({ id:'terr-label', type:'symbol', source:'terr-polys',
       layout:{ 'text-field':['get','name'], 'text-size':11, 'text-offset':[0,1.0], 'text-anchor':'top' },
       paint:{ 'text-halo-color':'#fff', 'text-halo-width':1.2 }});
 
-    const popup = (e) => {
-      const f = e.features[0];
-      const p = f.properties || {};
-      const st = map.getFeatureState({ source: e.sourceId, id: f.id });
-      const expl = st?.explain ? `<br><small>${st.explain}</small>` : '';
+    // popup
+    map.on('click','terr-fill', (e) => {
+      const p = e.features[0].properties || {};
       new maplibregl.Popup().setLngLat(e.lngLat)
-        .setHTML(`<strong>${p.name || 'Terras'}</strong><br>${st?.sunny ? '🌞 in de zon' : '⛅︎ schaduw'}${expl}`)
+        .setHTML(`<strong>${p.name || 'Terras'}</strong>`)
         .addTo(map);
-    };
-    map.on('click','terr-fill',popup);
-    map.on('click','terr-points',popup);
-
-    badge.textContent = `Poly ${TERR_POLY.features.length} • Pt ${TERR_PTS.features.length} • Gebouwen …`;
-    document.getElementById('dbgPoly').textContent = TERR_POLY.features.length;
-    document.getElementById('dbgPts').textContent  = TERR_PTS.features.length;
-    info.textContent = 'OK';
-
-    setupSunControls();
-
-    // eerste load
-    await loadBuildingsForViewport();
-    computePerTerraceSunAndApply();
-
-    // bij pan/zoom opnieuw gebouwen + zonnestates
-    let t;
-    map.on('moveend', async ()=>{
-      clearTimeout(t);
-      t = setTimeout(async ()=>{
-        await loadBuildingsForViewport();
-        computePerTerraceSunAndApply();
-      }, 150);
     });
 
+    // fit bounds
+    fitTo(POLYS);
+    info.textContent = 'OK';
+    badge.textContent = `Terrassen (polygons): ${POLYS.features.length}`;
   } catch (e) {
     info.textContent = 'Laden mislukt';
     console.error(e);
   }
 }
 
-/* ===== Gebouwen laden (OSM/Overpass) ===== */
-function currentBbox(){
-  const b = map.getBounds();
-  return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(',');
-}
-async function loadBuildingsForViewport(){
-  const bbox = currentBbox();
-  const r = await fetch(`/api/buildings?bbox=${bbox}`);
-  const j = await r.json().catch(()=>null);
-  BUILDINGS = j?.buildings || { type:'FeatureCollection', features:[] };
-  BUILDING_SRC = j?.source || '-';
-  BUILDING_STATS = j?.stats || null;
-
-  // filter op een beetje hoogte (API doet dit al, maar double-check)
-  BUILDINGS.features = (BUILDINGS.features||[]).filter(f => {
-    const h = f.properties?.h_m;
-    return typeof h === 'number' && h >= 3;
+function fitTo(polys){
+  const ex=[Infinity,Infinity,-Infinity,-Infinity];
+  const bump=([x,y])=>{ if(x<ex[0])ex[0]=x; if(y<ex[1])ex[1]=y; if(x>ex[2])ex[2]=x; if(y>ex[3])ex[3]=y; };
+  (polys.features||[]).forEach(f=>{
+    const rings = f.geometry.type==='Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates;
+    rings.forEach(poly=>poly[0].forEach(bump));
   });
-
-  const badge = document.getElementById('dataBadge');
-  if (badge) badge.textContent = `Poly ${TERR_POLY.features.length} • Pt ${TERR_PTS.features.length} • Gebouwen ${BUILDINGS.features.length} (OSM)`;
-
-  document.getElementById('dbgSrc').textContent = BUILDING_SRC;
-  document.getElementById('dbgBdg').textContent = BUILDINGS.features.length;
-  document.getElementById('dbgStats').textContent = BUILDING_STATS
-    ? `height:${BUILDING_STATS.used_height} • levels:${BUILDING_STATS.used_levels} • default:${BUILDING_STATS.used_default} • skip<3m:${BUILDING_STATS.skipped_too_low}`
-    : '';
-}
-
-/* ===== Zon per terras berekenen + tonen ===== */
-function computePerTerraceSunAndApply(){
-  const t=document.getElementById('time');
-  const d=document.getElementById('date');
-  const b=document.getElementById('sunBadge');
-  const only=document.getElementById('onlySunny');
-
-  const base = d.valueAsDate || new Date();
-  const [hh,mm] = (t.value||'12:00').split(':').map(x=>parseInt(x,10));
-  const when = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hh||12, mm||0);
-  const sp = sunPosition(when, AMS.lat, AMS.lon);
-  const alt = sp.altitude, az = sp.azimuth;
-  const sunOn = alt > ALT_MIN;
-
-  b.textContent = `Zon: alt ${alt.toFixed(1)}° • az ${Math.round(az)}° ${sunOn?'🌞':''}`;
-  document.getElementById('dbgAlt').textContent = alt.toFixed(1);
-  document.getElementById('dbgAz').textContent  = Math.round(az);
-
-  // Fallback: geen gebouwen → globale kleur
-  if (!BUILDINGS.features || BUILDINGS.features.length === 0) {
-    map.setPaintProperty('terr-fill',   'fill-color', sunOn ? COLORS.sunFill : COLORS.shadeFill);
-    map.setPaintProperty('terr-points', 'circle-color', sunOn ? COLORS.sunPt : COLORS.shadePt);
-    setAllVisibility(only.checked ? (sunOn ? 'visible' : 'none') : 'visible');
-    document.getElementById('dbgFilter').textContent = only.checked ? (sunOn?'alleen-zon (globaal)':'geen (donker)') : 'alle';
-    return;
-  }
-
-  // Met gebouwen: heuristiek
-  const sunnyFn = makeSunnyFn(alt, az, BUILDINGS);
-
-  const bounds = map.getBounds();
-  const inView = (f)=>{
-    const c = turf.center(f).geometry.coordinates;
-    return c[0] >= bounds.getWest() && c[0] <= bounds.getEast() &&
-           c[1] >= bounds.getSouth() && c[1] <= bounds.getNorth();
-  };
-
-  // feature-state per feature + uitleg
-  const setState = (sourceId, gj)=>{
-    for (const f of (gj.features||[])) {
-      let state = { sunny:false, explain:'zon te laag' };
-      if (sunOn && inView(f)) state = sunnyFn(f);
-      map.setFeatureState({ source: sourceId, id: f.id }, state);
-    }
-  };
-  setState('terr-polys', TERR_POLY);
-  setState('terr-points', TERR_PTS);
-
-  // kleur via feature-state
-  map.setPaintProperty('terr-fill',   'fill-color',   ['case',['boolean',['feature-state','sunny'],false], COLORS.sunFill,  COLORS.shadeFill]);
-  map.setPaintProperty('terr-points', 'circle-color', ['case',['boolean',['feature-state','sunny'],false], COLORS.sunPt,    COLORS.shadePt  ]);
-
-  // “alleen zon” → data-sets reduceren
-  if (only.checked) {
-    map.getSource('terr-polys').setData( filterSunny(TERR_POLY,  'terr-polys') );
-    map.getSource('terr-points').setData( filterSunny(TERR_PTS,   'terr-points') );
-    document.getElementById('dbgFilter').textContent = 'alleen-zon';
-  } else {
-    map.getSource('terr-polys').setData(TERR_POLY);
-    map.getSource('terr-points').setData(TERR_PTS);
-    document.getElementById('dbgFilter').textContent = 'alle';
-  }
-}
-
-function setAllVisibility(vis){
-  ['terr-fill','terr-outline','terr-label-polys','terr-points','terr-label-pts'].forEach(id=>{
-    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
-  });
-}
-
-function filterSunny(gj, sourceId){
-  const out = { type:'FeatureCollection', features:[] };
-  for (const f of (gj.features || [])) {
-    const st = map.getFeatureState({ source: sourceId, id: f.id });
-    if (st && st.sunny) out.features.push(f);
-  }
-  return out;
-}
-
-// Schaduw-heuristiek met uitleg:
-//  - Als zonhoogte ≤ ALT_MIN → schaduw
-//  - Alleen gebouwen binnen ±AZ_WINDOW° van zon-azimuth
-//  - Alleen gebouwen met h_m ≥ 3 m en binnen MAX_BUILDING_DIST_M
-//  - Schaduw als afstand ≤ h/tan(alt) + EXTRA_MARGIN_M
-function makeSunnyFn(altDeg, azDeg, buildings){
-  const altRad = altDeg * Math.PI/180;
-  const tanAlt = Math.max(Math.tan(altRad), 1e-4); // guard tegen bijna-0
-  const az = azDeg;
-  const azMin = az - AZ_WINDOW, azMax = az + AZ_WINDOW;
-
-  return function(terr){
-    if (altDeg <= ALT_MIN) return { sunny:false, explain:`alt ${altDeg.toFixed(1)}° ≤ ${ALT_MIN}°` };
-
-    const cTerr = turf.center(terr).geometry.coordinates;
-    let worst = null; // dichtsbijzijnde blokker
-    for (const b of (buildings.features || [])) {
-      const h = b.properties?.h_m;
-      if (!(typeof h === 'number' && h >= 3)) continue;
-
-      const cB = turf.center(b).geometry.coordinates;
-      const brg = turf.bearing(turf.point(cTerr), turf.point(cB));
-      const brg360 = (brg + 360) % 360;
-      if (!angleWithin(brg360, azMin, azMax)) continue;
-
-      const dKm = turf.distance(cTerr, cB);  // km
-      const d = dKm * 1000;                  // m
-      if (d > MAX_BUILDING_DIST_M) continue;
-
-      const L = h / tanAlt; // m
-      if (d <= L + EXTRA_MARGIN_M) {
-        if (!worst || d < worst.d) worst = { d, h, L };
-      }
-    }
-
-    if (worst) {
-      return { sunny:false, explain:`blok: d≈${Math.round(worst.d)}m, h≈${Math.round(worst.h)}m, L≈${Math.round(worst.L)}m` };
-    }
-    return { sunny:true, explain:`vrij (geen blokker in ±${AZ_WINDOW}° binnen ${MAX_BUILDING_DIST_M}m)` };
-  };
-}
-
-function angleWithin(a, min, max){
-  const norm = x => (x % 360 + 360) % 360;
-  const A = norm(a), MIN = norm(min), MAX = norm(max);
-  return (MIN <= MAX) ? (A >= MIN && A <= MAX) : (A >= MIN || A <= MAX);
-}
-
-/* ===== UI ===== */
-function setupSunControls(){
-  const t=document.getElementById('time');
-  const d=document.getElementById('date');
-  const btnNow=document.getElementById('btnNow');
-  const only=document.getElementById('onlySunny');
-
-  const now = new Date();
-  const pad = n => String(n).padStart(2,'0');
-  if (t) t.value = `${pad(now.getHours())}:${pad(now.getMinutes()-now.getMinutes()%5)}`;
-  if (d) d.valueAsDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-  function onChange(){ computePerTerraceSunAndApply(); }
-  t.addEventListener('input', onChange);
-  d.addEventListener('input', onChange);
-  only.addEventListener('change', onChange);
-  btnNow.addEventListener('click', ()=>{
-    const n=new Date();
-    if (t) t.value = `${pad(n.getHours())}:${pad(n.getMinutes()-n.getMinutes()%5)}`;
-    if (d) d.valueAsDate = new Date(n.getFullYear(), n.getMonth(), n.getDate());
-    computePerTerraceSunAndApply();
-  });
+  if (isFinite(ex[0])) map.fitBounds([[ex[0],ex[1]],[ex[2],ex[3]]], { padding:60, duration:600 });
 }
 </script>
 </body>
