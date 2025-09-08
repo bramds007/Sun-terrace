@@ -30,12 +30,13 @@ export default async function handler(req, res) {
   if (!fc) {
     return res.status(200).json({
       source:'osm-overpass', error: errors.join(' | '),
-      buildings: { type:'FeatureCollection', features:[] }, stats:{used_height:0,used_levels:0,used_default:0,skipped_too_low:0},
+      buildings: { type:'FeatureCollection', features:[] },
+      stats:{ used_height:0, used_levels:0, used_default:0, skipped_too_low:0 },
       debug:{ bbox, endpoint:null }
     });
   }
 
-  // Hoogte: height -> levels*3.2 -> default 10m. Filter <3m weg.
+  // Hoogte: height -> levels*3.2 -> default 8m. Filter <3m weg.
   let cH=0,cL=0,cD=0,cSkip=0;
   const out = { type:'FeatureCollection', features:[] };
   for (const f of fc.features) {
@@ -45,8 +46,12 @@ export default async function handler(req, res) {
       const lv = toNum(tags["building:levels"]) ?? toNum(tags.levels);
       if (lv != null) h = lv * 3.2;
     }
-    if (h != null) { if (parseHeight(tags.height)!=null) cH++; else cL++; }
-    else { h = 10; cD++; }
+    if (h != null) {
+      if (parseHeight(tags.height) != null) cH++; else cL++;
+    } else {
+      h = 8; // <<< verlaagd van 10 naar 8 m
+      cD++;
+    }
     if (h < 3) { cSkip++; continue; }
 
     f.properties = { ...f.properties, h_m: h };
@@ -90,7 +95,11 @@ function overpassToGeoJSON(data){
     if (el.type==='way' && Array.isArray(el.geometry)) {
       const coords = el.geometry.map(p => [p.lon,p.lat]);
       if (coords.length>=3 && (coords[0][0]!==coords.at(-1)[0] || coords[0][1]!==coords.at(-1)[1])) coords.push(coords[0]);
-      if (coords.length>=4) fc.features.push({ type:'Feature', id:`way.${el.id}`, properties:{ id:el.id, type:'way', tags: el.tags||{} }, geometry:{ type:'Polygon', coordinates:[coords] } });
+      if (coords.length>=4) fc.features.push({
+        type:'Feature', id:`way.${el.id}`,
+        properties:{ id:el.id, type:'way', tags: el.tags||{} },
+        geometry:{ type:'Polygon', coordinates:[coords] }
+      });
     }
   }
   for (const el of data.elements) {
@@ -105,8 +114,10 @@ function overpassToGeoJSON(data){
       }
       if (polys.length) {
         fc.features.push({
-          type:'Feature', id:`rel.${el.id}`, properties:{ id:el.id, type:'relation', tags: el.tags||{} },
-          geometry: polys.length===1 ? { type:'Polygon', coordinates:[polys[0]] } : { type:'MultiPolygon', coordinates: polys.map(r=>[r]) }
+          type:'Feature', id:`rel.${el.id}`,
+          properties:{ id:el.id, type:'relation', tags: el.tags||{} },
+          geometry: polys.length===1 ? { type:'Polygon', coordinates:[polys[0]] }
+                                     : { type:'MultiPolygon', coordinates: polys.map(r=>[r]) }
         });
       }
     }
